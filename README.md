@@ -1,1 +1,3 @@
-# Smart-Multi-Format-Electronic-Voting-Platform-Secured-by-Blockchain-Technology
+# Smart Multi-Format Electronic Voting Platform Secured by Blockchain Technology
+
+This is the first commit, coming soon...

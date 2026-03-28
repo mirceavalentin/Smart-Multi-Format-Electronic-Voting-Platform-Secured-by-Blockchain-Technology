@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin — Blockchain Voting Platform</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh; padding: 2rem;
+    }
+    h1 { text-align: center; margin-bottom: 0.25rem; font-size: 1.8rem; }
+    .subtitle { text-align: center; color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+    .badge {
+      display: inline-block; background: #ea580c; color: #fff;
+      font-size: 0.7rem; font-weight: 700; padding: 0.2rem 0.5rem;
+      border-radius: 4px; vertical-align: middle; margin-left: 0.5rem;
+    }
+
+    /* ── Layout ───────────────────────────────────────────────────── */
+    .grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;
+      max-width: 960px; margin: 0 auto;
+    }
+    @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+    /* ── Cards ────────────────────────────────────────────────────── */
+    .card {
+      background: #1e293b; border-radius: 12px; padding: 1.5rem;
+      border: 1px solid #334155;
+    }
+    .card h2 { font-size: 1.15rem; margin-bottom: 1rem; color: #38bdf8; }
+
+    /* ── Form elements ────────────────────────────────────────────── */
+    label { display: block; font-size: 0.85rem; margin-bottom: 0.3rem; color: #cbd5e1; }
+    input, textarea {
+      width: 100%; padding: 0.55rem 0.75rem; border-radius: 6px;
+      border: 1px solid #475569; background: #0f172a; color: #e2e8f0;
+      font-size: 0.9rem; margin-bottom: 0.75rem;
+    }
+    textarea { resize: vertical; min-height: 90px; font-family: monospace; font-size: 0.8rem; }
+    button {
+      display: inline-block; padding: 0.6rem 1.4rem; border: none;
+      border-radius: 6px; font-size: 0.9rem; font-weight: 600;
+      cursor: pointer; transition: background 0.2s; margin-bottom: 0.4rem;
+    }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-orange { background: #ea580c; color: #fff; }
+    .btn-orange:hover { background: #c2410c; }
+    .btn-sm { padding: 0.4rem 0.9rem; font-size: 0.82rem; }
+
+    /* ── Status bar ───────────────────────────────────────────────── */
+    #status-bar {
+      max-width: 960px; margin: 0 auto 1.5rem;
+      padding: 0.75rem 1rem; border-radius: 8px;
+      background: #1e293b; border: 1px solid #334155;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.85rem; gap: 1rem; flex-wrap: wrap;
+    }
+    #election-status { color: #facc15; }
+
+    /* ── Log console ──────────────────────────────────────────────── */
+    #log {
+      max-width: 960px; margin: 2rem auto 0;
+      background: #0f172a; border-radius: 12px; padding: 1rem 1.5rem;
+      border: 1px solid #334155; font-family: monospace; font-size: 0.8rem;
+      max-height: 320px; overflow-y: auto; white-space: pre-wrap; color: #94a3b8;
+    }
+    #log .ok   { color: #4ade80; display: block; }
+    #log .err  { color: #f87171; display: block; }
+    #log .warn { color: #facc15; display: block; }
+    #log .info { color: #94a3b8; display: block; }
+    #log .head { color: #38bdf8; display: block; }
+
+    /* ── Inspector output ─────────────────────────────────────────── */
+    .inspector-btns { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+
+  <h1>⛓ Blockchain Voting Platform <span class="badge">ADMIN</span></h1>
+  <p class="subtitle">Proof-of-Authority · Genesis Block Election Config · Auto-Wipe on Timer End</p>
+
+  <!-- ─── Status bar ────────────────────────────────────────────── -->
+  <div id="status-bar">
+    <span>Election: <span id="election-status">Loading…</span></span>
+    <button id="btn-refresh" class="btn-orange btn-sm">⟳ Refresh Status</button>
+  </div>
+
+  <!-- ─── Two-column layout ─────────────────────────────────────── -->
+  <div class="grid">
+
+    <!-- ── Admin Panel ───────────────────────────────────────────── -->
+    <div class="card">
+      <h2>🛠 Admin Panel</h2>
+
+      <label for="candidates">Candidates (comma-separated)</label>
+      <input id="candidates" placeholder="e.g. Alice, Bob, Charlie" />
+
+      <label for="whitelist">Voter Whitelist (one address per line)</label>
+      <textarea id="whitelist" placeholder="0xAbc123…&#10;0xDef456…"></textarea>
+
+      <label for="duration">Duration (seconds)</label>
+      <input id="duration" type="number" value="120" min="10" />
+
+      <button id="btn-start-election" class="btn-primary">🚀 Start Election</button>
+    </div>
+
+    <!-- ── Chain Inspector ───────────────────────────────────────── -->
+    <div class="card">
+      <h2>📊 Chain Inspector</h2>
+      <p style="font-size:0.85rem; color:#94a3b8; margin-bottom:1.2rem;">
+        Inspect the live blockchain and connected peers on this node.
+      </p>
+      <div class="inspector-btns">
+        <button id="btn-view-blocks" class="btn-orange">View Blockchain</button>
+        <button id="btn-view-pool" class="btn-orange">View Mempool</button>
+        <button id="btn-view-peers" class="btn-orange">View Peers</button>
+        <button id="btn-view-health" class="btn-orange">Node Health</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ─── Live terminal log ─────────────────────────────────────── -->
+  <div id="log"></div>
+
+  <!-- Ethers.js v5 — UMD build via unpkg (reliable CDN) -->
+  <script src="https://unpkg.com/ethers@5.7.2/dist/ethers.umd.min.js"
+          type="application/javascript"></script>
+  <script src="admin.js"></script>
+</body>
+</html>

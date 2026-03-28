@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voter Booth — Blockchain Voting Platform</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh; padding: 2rem;
+    }
+    h1 { text-align: center; margin-bottom: 0.25rem; font-size: 1.8rem; }
+    .subtitle { text-align: center; color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+    .badge {
+      display: inline-block; background: #16a34a; color: #fff;
+      font-size: 0.7rem; font-weight: 700; padding: 0.2rem 0.5rem;
+      border-radius: 4px; vertical-align: middle; margin-left: 0.5rem;
+    }
+    .container { max-width: 520px; margin: 0 auto; }
+
+    /* ── Cards ─────────────────────────────────────────────────────── */
+    .card {
+      background: #1e293b; border-radius: 12px; padding: 1.5rem;
+      border: 1px solid #334155; margin-bottom: 1.5rem;
+    }
+    .card h2 { font-size: 1.15rem; margin-bottom: 1rem; color: #38bdf8; }
+
+    /* ── Form elements ────────────────────────────────────────────── */
+    label { display: block; font-size: 0.85rem; margin-bottom: 0.3rem; color: #cbd5e1; }
+    select {
+      width: 100%; padding: 0.55rem 0.75rem; border-radius: 6px;
+      border: 1px solid #475569; background: #0f172a; color: #e2e8f0;
+      font-size: 0.9rem; margin-bottom: 0.75rem;
+    }
+    button {
+      display: block; width: 100%; padding: 0.65rem 1.4rem; border: none;
+      border-radius: 6px; font-size: 0.9rem; font-weight: 600;
+      cursor: pointer; transition: background 0.2s; margin-bottom: 0.5rem;
+    }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-green { background: #16a34a; color: #fff; }
+    .btn-green:hover { background: #15803d; }
+    .btn-green:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+
+    /* ── Status bar ───────────────────────────────────────────────── */
+    #status-bar {
+      padding: 0.75rem 1rem; border-radius: 8px;
+      background: #1e293b; border: 1px solid #334155;
+      margin-bottom: 1.5rem; font-size: 0.85rem;
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 1rem; flex-wrap: wrap;
+    }
+    #wallet-addr { color: #4ade80; font-family: monospace; word-break: break-all; }
+    #election-status { color: #facc15; }
+
+    /* ── Empty-state notice ───────────────────────────────────────── */
+    .no-election {
+      text-align: center; color: #64748b; padding: 1.5rem 0;
+      font-size: 0.9rem; border: 1px dashed #334155; border-radius: 8px;
+    }
+
+    /* ── Log ──────────────────────────────────────────────────────── */
+    #log {
+      background: #0f172a; border-radius: 12px; padding: 1rem 1.5rem;
+      border: 1px solid #334155; font-family: monospace; font-size: 0.8rem;
+      max-height: 250px; overflow-y: auto; white-space: pre-wrap; color: #94a3b8;
+    }
+    #log .ok   { color: #4ade80; display: block; }
+    #log .err  { color: #f87171; display: block; }
+    #log .warn { color: #facc15; display: block; }
+    #log .info { color: #94a3b8; display: block; }
+  </style>
+</head>
+<body>
+
+  <h1>⛓ Blockchain Voting Platform <span class="badge">VOTER</span></h1>
+  <p class="subtitle">Cast your vote · Signed with MetaMask · Secured by PoA blockchain</p>
+
+  <div class="container">
+
+    <!-- ─── Status bar ──────────────────────────────────────────── -->
+    <div id="status-bar">
+      <span>Wallet: <span id="wallet-addr">Not connected</span></span>
+      <span>Election: <span id="election-status">Loading…</span></span>
+    </div>
+
+    <!-- ─── Connect MetaMask ────────────────────────────────────── -->
+    <div class="card">
+      <h2>🔑 Wallet</h2>
+      <button id="btn-connect" class="btn-primary">Connect MetaMask</button>
+    </div>
+
+    <!-- ─── Voter Booth ─────────────────────────────────────────── -->
+    <div class="card">
+      <h2>🗳 Voter Booth</h2>
+      <div id="no-election" class="no-election">
+        No active election. Ask the admin to start one.
+      </div>
+      <div id="vote-form" style="display:none;">
+        <label for="candidate-select">Choose a candidate</label>
+        <select id="candidate-select"></select>
+        <button id="btn-cast-vote" class="btn-green" disabled>
+          Cast Vote (sign with MetaMask)
+        </button>
+      </div>
+    </div>
+
+    <!-- ─── Event log ───────────────────────────────────────────── -->
+    <div id="log"></div>
+
+  </div>
+
+  <!-- Ethers.js v5 — UMD build via unpkg (reliable CDN) -->
+  <script src="https://unpkg.com/ethers@5.7.2/dist/ethers.umd.min.js"
+          type="application/javascript"></script>
+  <script src="voter.js"></script>
+</body>
+</html>

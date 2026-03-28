@@ -1,0 +1,38 @@
+{
+  "name": "blockchain-voting-platform",
+  "version": "0.1.0",
+  "description": "Smart Multi-Format Electronic Voting Platform Secured by Blockchain Technology",
+  "author": "Mircea",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node -r tsconfig-paths/register src/server.ts",
+    "test": "jest --runInBand",
+    "test:unit": "jest --runInBand --selectProjects unit",
+    "test:integration": "jest --runInBand --selectProjects integration",
+    "lint": "eslint src/ --ext .ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "express": "^4.21.0",
+    "mongoose": "^8.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.7.0",
+    "@types/ws": "^8.5.12",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.6.0",
+    "ts-node": "^10.9.2"
+  }
+}

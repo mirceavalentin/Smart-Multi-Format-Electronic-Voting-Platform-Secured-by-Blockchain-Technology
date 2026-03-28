@@ -1,0 +1,245 @@
+# podman-compose.yml  (compatible with docker-compose v3.8 syntax)
+#
+# 4-Node Private Blockchain Network for the Voting Platform
+# ==========================================================
+#
+# Architecture:
+#   Gateway  (Node A) — the ONLY node exposing the REST API to the host.
+#   Validator 1–3     — participate in consensus; no external HTTP access.
+#
+# Each logical node = 2 containers: a MongoDB instance + the Node.js app.
+#
+# ─── HOW depends_on + healthcheck SOLVES THE STARTUP CRASH ───────────
+#
+# PROBLEM:
+#   The previous compose file used a bare `depends_on: [mongo-x]`, which
+#   only guarantees that the *container process* has started — NOT that
+#   MongoDB is actually ready to accept connections. MongoDB can take
+#   several seconds to initialise its journal, allocate the WiredTiger
+#   cache, and begin listening on port 27017. During that window the
+#   Node.js app calls `mongoose.connect()`, gets ECONNREFUSED, throws
+#   an unhandled error, and the process exits — killing the container.
+#
+# SOLUTION:
+#   1. Each MongoDB service defines a `healthcheck` that runs
+#      `mongosh --eval "db.adminCommand('ping')"` every 5 seconds.
+#      This command only succeeds when Mongo is fully initialised and
+#      accepting commands.
+#
+#   2. Each app service uses `depends_on: { <db>: { condition: service_healthy } }`.
+#      This tells the orchestrator: "do NOT start this container until
+#      the DB container's healthcheck has returned 0 (healthy) at least
+#      once".
+#
+#   Combined, this guarantees that by the time `node dist/index.js`
+#   executes, its MongoDB is already listening — eliminating the race
+#   condition. The app-level retry loop in index.ts provides a second
+#   layer of defence in case of transient network hiccups.
+#
+# ─── WHY ONLY THE GATEWAY EXPOSES PORT 3000 ─────────────────────────
+#
+# External clients (front-end, admin tools) interact through one
+# controlled entry point. Validators exist only for consensus + ledger
+# replication and should never accept external HTTP traffic. This:
+#   • Reduces attack surface (fewer publicly reachable services).
+#   • Enforces separation of concerns (API ingestion vs. consensus).
+#   • Mirrors real permissioned blockchain topologies (Hyperledger Fabric
+#     peers vs. SDK gateways).
+#
+# ─── USAGE ───────────────────────────────────────────────────────────
+#   podman-compose up --build        (build & start all 4 nodes)
+#   podman-compose down -v           (stop & remove volumes)
+
+version: "3.8"
+
+# ══════════════════════════════════════════════════════════════════════
+#  SERVICES
+# ══════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────
+  #  GATEWAY (Node A)
+  # ────────────────────────────────────────────────────────────────────
+
+  gateway-db:
+    image: docker.io/library/mongo:7
+    container_name: gateway-db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - gateway-db-data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - blockchain-net
+
+  gateway-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gateway-app
+    restart: unless-stopped
+    depends_on:
+      gateway-db:
+        condition: service_healthy
+    environment:
+      NODE_NAME: "gateway"
+      IS_VALIDATOR: "false"
+      HTTP_PORT: "3000"
+      P2P_PORT: "6000"
+      MONGO_URI: "mongodb://gateway-db:27017/voting_node_db"
+      PEERS: "ws://validator1-app:6000,ws://validator2-app:6000,ws://validator3-app:6000"
+    ports:
+      - "3000:3000"         # REST API — exposed to host (gateway only)
+    networks:
+      - blockchain-net
+
+  # ────────────────────────────────────────────────────────────────────
+  #  VALIDATOR 1 (Node B)
+  # ────────────────────────────────────────────────────────────────────
+
+  validator1-db:
+    image: docker.io/library/mongo:7
+    container_name: validator1-db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - validator1-db-data:/data/db
+    ports:
+      - "27018:27017"
+    networks:
+      - blockchain-net
+
+  validator1-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: validator1-app
+    restart: unless-stopped
+    depends_on:
+      validator1-db:
+        condition: service_healthy
+    environment:
+      NODE_NAME: "validator-1"
+      IS_VALIDATOR: "true"
+      HTTP_PORT: "3000"
+      P2P_PORT: "6000"
+      MONGO_URI: "mongodb://validator1-db:27017/voting_node_db"
+      PEERS: "ws://gateway-app:6000,ws://validator2-app:6000,ws://validator3-app:6000"
+    # Port 3000 NOT exposed — validators do not serve external API traffic.
+    networks:
+      - blockchain-net
+
+  # ────────────────────────────────────────────────────────────────────
+  #  VALIDATOR 2 (Node C)
+  # ────────────────────────────────────────────────────────────────────
+
+  validator2-db:
+    image: docker.io/library/mongo:7
+    container_name: validator2-db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - validator2-db-data:/data/db
+    ports:
+      - "27019:27017"
+    networks:
+      - blockchain-net
+
+  validator2-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: validator2-app
+    restart: unless-stopped
+    depends_on:
+      validator2-db:
+        condition: service_healthy
+    environment:
+      NODE_NAME: "validator-2"
+      IS_VALIDATOR: "true"
+      HTTP_PORT: "3000"
+      P2P_PORT: "6000"
+      MONGO_URI: "mongodb://validator2-db:27017/voting_node_db"
+      PEERS: "ws://gateway-app:6000,ws://validator1-app:6000,ws://validator3-app:6000"
+    networks:
+      - blockchain-net
+
+  # ────────────────────────────────────────────────────────────────────
+  #  VALIDATOR 3 (Node D)
+  # ────────────────────────────────────────────────────────────────────
+
+  validator3-db:
+    image: docker.io/library/mongo:7
+    container_name: validator3-db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - validator3-db-data:/data/db
+    ports:
+      - "27020:27017"
+    networks:
+      - blockchain-net
+
+  validator3-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: validator3-app
+    restart: unless-stopped
+    depends_on:
+      validator3-db:
+        condition: service_healthy
+    environment:
+      NODE_NAME: "validator-3"
+      IS_VALIDATOR: "true"
+      HTTP_PORT: "3000"
+      P2P_PORT: "6000"
+      MONGO_URI: "mongodb://validator3-db:27017/voting_node_db"
+      PEERS: "ws://gateway-app:6000,ws://validator1-app:6000,ws://validator2-app:6000"
+    networks:
+      - blockchain-net
+
+# ══════════════════════════════════════════════════════════════════════
+#  VOLUMES — each node's MongoDB gets its own persistent volume
+# ══════════════════════════════════════════════════════════════════════
+
+volumes:
+  gateway-db-data:
+  validator1-db-data:
+  validator2-db-data:
+  validator3-db-data:
+
+# ══════════════════════════════════════════════════════════════════════
+#  NETWORKS
+# ══════════════════════════════════════════════════════════════════════
+#
+# A single user-defined bridge network connects all 8 containers.
+# Service names act as DNS hostnames, so app containers reach each
+# other via ws://validator1-app:6000 and their DBs via
+# mongodb://validator1-db:27017.
+
+networks:
+  blockchain-net:
+    driver: bridge

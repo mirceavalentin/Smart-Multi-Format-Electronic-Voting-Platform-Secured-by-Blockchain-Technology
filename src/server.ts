@@ -68,7 +68,7 @@ const PEERS: string[] = (process.env["PEERS"] ?? "")
   .filter(Boolean);
 
 const VALIDATOR_INTERVAL_MS: number =
-  parseInt(process.env["VALIDATOR_INTERVAL_MS"] ?? "15000", 10);
+  parseInt(process.env["VALIDATOR_INTERVAL_MS"] ?? "15000", 5);
 
 // ─── Core singletons ───────────────────────────────────────────────
 const blockchain = new Blockchain();
@@ -222,6 +222,9 @@ app.post("/api/election", (req: Request, res: Response) => {
   // ── Build election config ─────────────────────────────────────────
   const endTime = Date.now() + durationSeconds * 1000;
   const electionId = `election-${Date.now()}`;
+
+  // Clear results from previous election
+  lastTally = null;
 
   election.activate({ electionId, candidates, whitelist, endTime });
 
@@ -412,23 +415,32 @@ app.post("/api/vote", (req: Request, res: Response) => {
 async function main(): Promise<void> {
   await connectToDatabase(MONGO_URI);
 
-  // Persist genesis block if not already present
+  // Wipe any stale blocks from a previous run so the in-memory chain
+  // (which always starts at genesis) stays in sync with MongoDB.
+  try {
+    const stale = await BlockModel.deleteMany({});
+    if (stale.deletedCount > 0) {
+      console.log(
+        `[${NODE_NAME}] 🗑 Boot wipe: removed ${stale.deletedCount} stale block(s) from MongoDB.`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[${NODE_NAME}] Boot wipe failed: ${msg}`);
+  }
+
+  // Persist the fresh genesis block
   const genesisBlock = blockchain.chain[0]!;
   try {
-    const existing = await BlockModel.findOne({ index: 0 });
-    if (!existing) {
-      await BlockModel.create({
-        index: genesisBlock.index,
-        timestamp: genesisBlock.timestamp,
-        transactions: genesisBlock.transactions,
-        previousHash: genesisBlock.previousHash,
-        hash: genesisBlock.hash,
-        nonce: genesisBlock.nonce,
-      });
-      console.log(`[${NODE_NAME}] ✔ Genesis block persisted (hash: ${genesisBlock.hash}).`);
-    } else {
-      console.log(`[${NODE_NAME}] ℹ Genesis block already in MongoDB.`);
-    }
+    await BlockModel.create({
+      index: genesisBlock.index,
+      timestamp: genesisBlock.timestamp,
+      transactions: genesisBlock.transactions,
+      previousHash: genesisBlock.previousHash,
+      hash: genesisBlock.hash,
+      nonce: genesisBlock.nonce,
+    });
+    console.log(`[${NODE_NAME}] ✔ Genesis block persisted (hash: ${genesisBlock.hash}).`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[${NODE_NAME}] Genesis persist failed: ${msg}`);

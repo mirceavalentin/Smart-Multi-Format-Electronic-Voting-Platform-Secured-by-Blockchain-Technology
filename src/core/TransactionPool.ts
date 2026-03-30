@@ -104,6 +104,17 @@ export class TransactionPool {
   }
 
   /**
+   * Remove votes that have been mined into a block.
+   *
+   * After a peer mines a block and broadcasts it, receiving nodes must
+   * remove those transactions from their own pool to prevent duplicate
+   * mining. We match by signature since it is unique per vote.
+   */
+  public removeMinedTransactions(signatures: Set<string>): void {
+    this.pending = this.pending.filter((v) => !signatures.has(v.signature));
+  }
+
+  /**
    * Return the number of votes currently waiting in the pool.
    *
    * Useful for the Validator loop condition ("only mine if there are

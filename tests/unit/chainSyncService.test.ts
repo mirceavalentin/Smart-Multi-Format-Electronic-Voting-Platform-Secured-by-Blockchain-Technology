@@ -1,5 +1,6 @@
 import { ChainSyncService } from "../../src/network/chainSyncService.js";
 import { Blockchain } from "../../src/core/Blockchain.js";
+import { TransactionPool } from "../../src/core/TransactionPool.js";
 import { Block } from "../../src/core/Block.js";
 import { MessageType } from "../../src/network/messageTypes.js";
 
@@ -20,8 +21,9 @@ describe("ChainSyncService", () => {
 
   test("appends one valid next block and broadcasts latest tip", async () => {
     const blockchain = new Blockchain();
+    const txPool = new TransactionPool();
     const onBroadcast = jest.fn();
-    const service = new ChainSyncService(blockchain, "unit-node", onBroadcast);
+    const service = new ChainSyncService(blockchain, txPool, "unit-node", onBroadcast);
 
     const latest = blockchain.getLatestBlock();
     const nextBlock = new Block(
@@ -43,8 +45,9 @@ describe("ChainSyncService", () => {
 
   test("requests full chain when single block does not extend local tip", () => {
     const blockchain = new Blockchain();
+    const txPool = new TransactionPool();
     const onBroadcast = jest.fn();
-    const service = new ChainSyncService(blockchain, "unit-node", onBroadcast);
+    const service = new ChainSyncService(blockchain, txPool, "unit-node", onBroadcast);
 
     const incompatibleBlock = new Block(
       blockchain.getLatestBlock().index + 5,

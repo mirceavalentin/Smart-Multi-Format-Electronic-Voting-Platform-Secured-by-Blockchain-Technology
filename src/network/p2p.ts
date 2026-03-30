@@ -46,6 +46,7 @@ import { Election } from "../core/Election.js";
 import type { ElectionConfig } from "../core/Election.js";
 import { ChainSyncService } from "./chainSyncService.js";
 import { TransactionGossipService } from "./transactionGossipService.js";
+import { BlockModel } from "../db/models.js";
 import {
   MessageType,
   queryLatestMsg,
@@ -94,6 +95,7 @@ export class P2PNetwork {
 
     this.chainSyncService = new ChainSyncService(
       this.blockchain,
+      this.txPool,
       this.nodeName,
       (message: P2PMessage) => this.broadcast(message),
     );
@@ -179,7 +181,7 @@ export class P2PNetwork {
 
     ws.on("close", () => {
       this.sockets = this.sockets.filter((s) => s !== ws);
-      console.log(`[${this.nodeName}] [P2P] Peer disconnected. Active peers: ${this.sockets.length}`);
+      console.log(`[${this.nodeName}] [P2P] Peer disconnected. Active peers: ${this.getPeerCount()}`);
     });
 
     ws.on("error", () => {
@@ -300,9 +302,16 @@ export class P2PNetwork {
     );
   }
 
-  /** Return the count of currently connected peers. */
+  /**
+   * Return the count of unique peers.
+   *
+   * In a full-mesh topology every pair of nodes holds two sockets
+   * (A→B outbound + B→A outbound). We divide by 2 to report the
+   * true number of distinct peer nodes.
+   */
   public getPeerCount(): number {
-    return this.sockets.filter((s) => s.readyState === WebSocket.OPEN).length;
+    const open = this.sockets.filter((s) => s.readyState === WebSocket.OPEN).length;
+    return Math.floor(open / 2);
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -329,5 +338,53 @@ export class P2PNetwork {
     );
 
     this.election.activate(config);
+
+    // Schedule auto-wipe so Validators also reset after the election ends.
+    // The Gateway schedules its own wipe in the POST /api/election handler;
+    // this ensures Validators (who only learn about the election via P2P)
+    // also clean up their MongoDB and in-memory state.
+    const delayMs = Math.max(0, config.endTime - Date.now());
+    console.log(
+      `[${this.nodeName}] [P2P] Auto-wipe timer set for ${Math.round(delayMs / 1000)}s.`,
+    );
+
+    setTimeout(async () => {
+      console.log(
+        `[${this.nodeName}] [P2P] Auto-wipe firing for "${config.electionId}"...`,
+      );
+
+      try {
+        const deleted = await BlockModel.deleteMany({});
+        console.log(
+          `[${this.nodeName}] Auto-wipe: deleted ${deleted.deletedCount} block(s) from MongoDB.`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[${this.nodeName}] Auto-wipe DB delete failed: ${msg}`);
+      }
+
+      this.blockchain.resetToGenesis();
+      this.txPool.clearPool();
+      this.election.deactivate();
+
+      // Re-persist fresh genesis block
+      const genesisBlock = this.blockchain.chain[0]!;
+      try {
+        await BlockModel.create({
+          index: genesisBlock.index,
+          timestamp: genesisBlock.timestamp,
+          transactions: genesisBlock.transactions,
+          previousHash: genesisBlock.previousHash,
+          hash: genesisBlock.hash,
+          nonce: genesisBlock.nonce,
+        });
+        console.log(`[${this.nodeName}] Fresh genesis block persisted after auto-wipe.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[${this.nodeName}] Failed to re-persist genesis: ${msg}`);
+      }
+
+      console.log(`[${this.nodeName}] Auto-wipe complete. Ready for a new election.`);
+    }, delayMs);
   }
 }

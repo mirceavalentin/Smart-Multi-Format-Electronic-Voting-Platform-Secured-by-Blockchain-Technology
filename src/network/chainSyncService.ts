@@ -20,6 +20,7 @@
 import type { Block as IBlock } from "../models/block.js";
 import { Block } from "../core/Block.js";
 import { Blockchain } from "../core/Blockchain.js";
+import { TransactionPool } from "../core/TransactionPool.js";
 import { BlockModel } from "../db/models.js";
 import {
   queryAllMsg,
@@ -29,15 +30,18 @@ import {
 
 export class ChainSyncService {
   private blockchain: Blockchain;
+  private txPool: TransactionPool;
   private nodeName: string;
   private onBroadcast: (message: P2PMessage) => void;
 
   constructor(
     blockchain: Blockchain,
+    txPool: TransactionPool,
     nodeName: string,
     onBroadcast: (message: P2PMessage) => void,
   ) {
     this.blockchain = blockchain;
+    this.txPool = txPool;
     this.nodeName = nodeName;
     this.onBroadcast = onBroadcast;
   }
@@ -108,6 +112,13 @@ export class ChainSyncService {
 
     this.blockchain.chain.push(newBlock);
 
+    // Remove mined transactions from our local pool to prevent duplicate mining
+    const minedSigs = new Set<string>();
+    for (const tx of newBlock.transactions) {
+      minedSigs.add(tx.signature);
+    }
+    this.txPool.removeMinedTransactions(minedSigs);
+
     this.persistBlock(newBlock).catch((err) => {
       console.error(`[${this.nodeName}] [P2P] Failed to persist received block:`, err);
     });
@@ -146,6 +157,15 @@ export class ChainSyncService {
     );
 
     this.blockchain.chain = candidateChain;
+
+    // After replacing the full chain, clear pool of any already-mined transactions
+    const allMinedSigs = new Set<string>();
+    for (const block of candidateChain) {
+      for (const tx of block.transactions) {
+        allMinedSigs.add(tx.signature);
+      }
+    }
+    this.txPool.removeMinedTransactions(allMinedSigs);
 
     this.persistFullChain(candidateChain).catch((err) => {
       console.error(`[${this.nodeName}] [P2P] Failed to persist replaced chain:`, err);

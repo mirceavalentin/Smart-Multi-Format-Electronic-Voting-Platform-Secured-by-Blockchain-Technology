@@ -1,0 +1,160 @@
+%% =============================================================================
+%%  Section 3.4 — Class diagram (data model)
+%%  Mirrors src/core/* and src/network/* as of the current implementation.
+%%  Every method shown exists in the source with the signature given here.
+%% =============================================================================
+
+classDiagram
+    direction TB
+
+    %% ── Data interfaces ──────────────────────────────────────────────
+    class Vote {
+        <<interface>>
+        +senderPublicKey: string
+        +candidateId: string
+        +electionId: string
+        +timestamp: string
+        +signature: string
+    }
+
+    class IBlock {
+        <<interface>>
+        +index: number
+        +timestamp: string
+        +transactions: Vote[]
+        +previousHash: string
+        +hash: string
+        +nonce: number
+    }
+
+    class ElectionType {
+        <<type>>
+        "single-choice"
+        "multiple-choice"
+        "yes-no"
+    }
+
+    class ElectionConfig {
+        <<interface>>
+        +electionId: string
+        +type: ElectionType
+        +candidates: string[]
+        +whitelist: string[]
+        +endTime: number
+        +isActive: boolean
+        +question?: string
+        +maxSelections?: number
+    }
+
+    %% ── Core domain classes ──────────────────────────────────────────
+    class Block {
+        +index: number
+        +timestamp: string
+        +transactions: Vote[]
+        +previousHash: string
+        +hash: string
+        +nonce: number
+        +constructor(index, timestamp, transactions, previousHash, nonce)
+        +calculateHash() string
+        +toJSON() IBlock
+    }
+
+    class Blockchain {
+        +chain: Block[]
+        +constructor()
+        -createGenesisBlock() Block
+        +getLatestBlock() Block
+        +addBlock(transactions: Vote[]) Block
+        +isChainValid() boolean
+        +resetToGenesis() void
+    }
+
+    class Election {
+        -config: ElectionConfig | null
+        +activate(data) void
+        +deactivate() void
+        +reset() void
+        +getConfig() ElectionConfig
+        +isActive: boolean
+        +isVoteValid(vote) {valid, reason?}
+        -validateBallotPayload(candidateId) {valid, reason?}
+    }
+
+    class State {
+        -votedAddresses: Set~string~
+        +hasVoted(address) boolean
+        +markVoted(address) void
+        +voterCount: number
+        +clear() void
+    }
+
+    class TransactionPool {
+        -pending: Vote[]
+        +addTransaction(vote: Vote) void
+        +getTransactions() Vote[]
+        +clearPool() void
+        +removeMinedTransactions(signatures: Set~string~) void
+        +size: number
+    }
+
+    %% ── Network layer ────────────────────────────────────────────────
+    class MessageBus {
+        -connection: ChannelModel
+        -channel: Channel
+        -nodeName: string
+        -queueVotes: string
+        -queueElection: string
+        -queueBlocks: string
+        -queueChainReq: string
+        -queueChainRes: string
+        +constructor(nodeName: string)
+        +connect(url, maxRetries, delayMs) Promise~void~
+        +isConnected: boolean
+        -declareInfrastructure() Promise~void~
+        +publishVote(vote: Vote) void
+        +publishElection(config: ElectionConfig) void
+        +publishBlock(block: IBlock) void
+        +publishChainResponse(replyQueue, chain) void
+        -publishChainRequest() void
+        +subscribeToVotes(handler) Promise~void~
+        +subscribeToElections(handler) Promise~void~
+        +subscribeToBlocks(handler) Promise~void~
+        +subscribeToChainRequests(handler) Promise~void~
+        +requestFullChain() Promise~IBlock[][]~
+    }
+
+    class ChainSyncService {
+        -blockchain: Blockchain
+        -txPool: TransactionPool
+        -nodeName: string
+        -onPublishBlock: (block) => void
+        -onRequestFullChain: () => Promise~IBlock[][]~
+        +constructor(blockchain, txPool, nodeName, onPublishBlock, onRequestFullChain)
+        +handleReceivedBlock(data: string) void
+        -appendBlock(received: IBlock) void
+        -syncFullChain() Promise~void~
+        -tryReplaceChain(receivedBlocks: IBlock[]) void
+        -persistBlock(block: Block) Promise~void~
+        -persistFullChain(chain: Block[]) Promise~void~
+    }
+
+    class TransactionGossipService {
+        -txPool: TransactionPool
+        -nodeName: string
+        +constructor(txPool, nodeName)
+        +handleIncomingVote(data: string) void
+    }
+
+    %% ── Relationships ────────────────────────────────────────────────
+    Block            ..|> IBlock              : implements
+    Block      "1" *-- "*"  Vote              : transactions
+    Blockchain "1" *-- "1..*" Block           : chain
+    Election   "1" o-- "0..1" ElectionConfig  : config
+    ElectionConfig --> ElectionType           : type
+    TransactionPool "1" *-- "*" Vote          : pending
+
+    ChainSyncService --> Blockchain           : reads / mutates
+    ChainSyncService --> TransactionPool      : prunes mined votes
+    ChainSyncService ..> MessageBus           : via callbacks<br/>(onPublishBlock,<br/>onRequestFullChain)
+
+    TransactionGossipService --> TransactionPool : addTransaction()

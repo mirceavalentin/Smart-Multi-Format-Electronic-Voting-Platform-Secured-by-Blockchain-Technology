@@ -1,40 +1,42 @@
 /**
- * ============================================================================
- *  network/transactionGossipService.ts — Mempool gossip handler.
- * ============================================================================
+ * transactionGossipService.ts — Mempool vote ingestion from the message bus.
  *
- * This module isolates vote transaction ingestion logic from socket and
- * chain-sync responsibilities. It handles BROADCAST_TRANSACTION payloads and
- * updates the shared TransactionPool.
- * ============================================================================
+ * When a VOTE message arrives on a Validator's queue, the raw payload is a
+ * JSON string. This service parses it and adds the vote to the local
+ * TransactionPool so the next mining cycle can seal it into a block.
+ *
+ * Keeping this in its own class rather than inline in messageBus.ts
+ * preserves the separation of concerns from the original design and makes
+ * the parsing + pool-add logic independently unit-testable.
  */
 
-import type { Vote } from "../models/vote.js";
-import { TransactionPool } from "../core/TransactionPool.js";
+import type { Vote }        from "../models/vote.js";
+import { TransactionPool }  from "../core/TransactionPool.js";
 
 export class TransactionGossipService {
-  private txPool: TransactionPool;
-  private nodeName: string;
+  constructor(
+    private readonly txPool:    TransactionPool,
+    private readonly nodeName:  string,
+  ) {}
 
-  constructor(txPool: TransactionPool, nodeName: string) {
-    this.txPool = txPool;
-    this.nodeName = nodeName;
-  }
-
-  /** Parse and enqueue a BROADCAST_TRANSACTION payload. */
-  public handleBroadcastTransaction(data: string): void {
+  /**
+   * Parse a raw JSON vote payload and add it to the mempool.
+   *
+   * @param data - JSON-serialised Vote object (msg.content.toString()).
+   */
+  public handleIncomingVote(data: string): void {
     let vote: Vote;
     try {
       vote = JSON.parse(data) as Vote;
     } catch {
-      console.warn(`[${this.nodeName}] [P2P] Invalid transaction data received, ignoring.`);
+      console.warn(`[${this.nodeName}] [Gossip] Invalid vote payload received — ignoring.`);
       return;
     }
 
     this.txPool.addTransaction(vote);
     console.log(
-      `[${this.nodeName}] [P2P] Received BROADCAST_TRANSACTION -> ` +
-      `added vote to pool (pool size: ${this.txPool.size}).`,
+      `[${this.nodeName}] [Gossip] Vote added to mempool ` +
+      `(candidate: ${vote.candidateId}, pool size: ${this.txPool.size}).`,
     );
   }
 }

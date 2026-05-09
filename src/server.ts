@@ -1,215 +1,231 @@
 /**
- * ============================================================================
- *  server.ts — Single-file entry point for the voting node.
- * ============================================================================
+ * server.ts — Single entry point for a voting node.
  *
- * SINGLE-USE PROTOTYPE DESIGN (for thesis defence):
+ * WHAT THIS FILE DOES
+ * ───────────────────
+ * 1. Reads configuration from environment variables (via utils/config.ts).
+ * 2. Connects to MongoDB (for persistent block storage).
+ * 3. Connects to the RabbitMQ message bus (for inter-node communication).
+ * 4. Registers RabbitMQ subscriptions so this node reacts to votes,
+ *    election configs, and new blocks from other nodes.
+ * 5. Starts the Express HTTP server with all API routes.
+ * 6. If this node is a Validator, starts the mining loop.
  *
- * This file wires up the entire node: Express HTTP routes (inline),
- * static-file serving for the web GUI, blockchain core, P2P gossip,
- * MongoDB persistence, and the auto-wipe mechanism.
+ * NODE ROLES
+ * ──────────
+ * Gateway  (IS_VALIDATOR=false)
+ *   • Serves the web UI from public/.
+ *   • Accepts POST /api/election and POST /api/vote from browsers.
+ *   • Publishes accepted votes and election configs to RabbitMQ.
+ *   • Never mines blocks.
  *
- * ARCHITECTURE — Proof of Authority (PoA) with Mempool
- * ────────────────────────────────────────────────────
+ * Validator (IS_VALIDATOR=true)
+ *   • Subscribes to vote and block messages from RabbitMQ.
+ *   • Drains its mempool into a new block every VALIDATOR_INTERVAL_MS.
+ *   • Publishes newly mined blocks to RabbitMQ for chain sync.
+ *   • Does not expose its HTTP port externally.
  *
- *   **Gateway** (IS_VALIDATOR=false):
- *     - Serves the web GUI from `public/`.
- *     - Accepts POST /election and POST /vote from the browser.
- *     - Relays votes to all peers via P2P (BROADCAST_TRANSACTION).
- *     - Never creates blocks — it is an untrusted relay.
+ * AUTO-WIPE
+ * ─────────
+ * After the election timer expires, every node (Gateway and Validators alike)
+ * runs the auto-wipe sequence:
+ *   1. Tallies votes from the immutable chain (Gateway only — for the results API).
+ *   2. Deletes all blocks from MongoDB.
+ *   3. Resets the in-memory chain to just the genesis block.
+ *   4. Clears the mempool and double-vote tracker.
+ *   5. Re-persists the fresh genesis block so MongoDB stays consistent.
  *
- *   **Validator** (IS_VALIDATOR=true):
- *     - Receives votes via P2P and stores them in its TransactionPool.
- *     - Every VALIDATOR_INTERVAL_MS it drains the pool into a new block,
- *       persists it to MongoDB, and broadcasts the block to all peers.
- *
- * AUTO-WIPE (why + how):
- *
- *   After the election timer expires, each node:
- *     1. Tallies votes from the IMMUTABLE blockchain.
- *     2. Deletes ALL blocks from MongoDB   →  fresh DB for next demo.
- *     3. Resets the in-memory chain to just the genesis block.
- *     4. Clears the mempool and double-vote tracking set.
- *     5. Sets election.isActive = false.
- *
- *   This lets the thesis examiner run a full election lifecycle in ~60s
- *   and immediately start another round without restarting containers.
- * ============================================================================
+ * The Gateway triggers its auto-wipe from the POST /api/election handler.
+ * Validators trigger theirs from the ELECTION message subscription.
+ * Both call the shared `scheduleAutoWipe()` helper below.
  */
 
 import path from "path";
 import express, { type Request, type Response } from "express";
 import { ethers } from "ethers";
 
-import { connectToDatabase } from "./db/connection.js";
-import { BlockModel } from "./db/models.js";
-import { Blockchain } from "./core/Blockchain.js";
-import { TransactionPool } from "./core/TransactionPool.js";
-import { State } from "./core/State.js";
-import { Election } from "./core/Election.js";
-import { P2PNetwork } from "./network/p2p.js";
-import {
-  responseBlockchainMsg,
-  broadcastTransactionMsg,
-  electionCreatedMsg,
-} from "./network/messageTypes.js";
-import type { Vote } from "./models/vote.js";
+import { loadConfig }            from "./utils/config.js";
+import { connectToDatabase }     from "./db/connection.js";
+import { BlockModel }            from "./db/models.js";
+import { Blockchain }            from "./core/Blockchain.js";
+import { TransactionPool }       from "./core/TransactionPool.js";
+import { State }                 from "./core/State.js";
+import { Election, MULTI_CHOICE_SEPARATOR } from "./core/Election.js";
+import type { ElectionConfig, ElectionType } from "./core/Election.js";
+import { MessageBus }            from "./network/messageBus.js";
+import { ChainSyncService }      from "./network/chainSyncService.js";
+import { TransactionGossipService } from "./network/transactionGossipService.js";
+import type { Vote }             from "./models/vote.js";
+import type { Block as IBlock }  from "./models/block.js";
 
-// ─── Configuration from environment ─────────────────────────────────
-const PORT: number = parseInt(process.env["PORT"] ?? process.env["HTTP_PORT"] ?? "3000", 10);
-const P2P_PORT: number = parseInt(process.env["P2P_PORT"] ?? "6000", 10);
-const MONGO_URI: string =
-  process.env["MONGO_URI"] ?? "mongodb://localhost:27017/voting_node_db";
-const NODE_NAME: string = process.env["NODE_NAME"] ?? "node-local";
-const IS_VALIDATOR: string = process.env["IS_VALIDATOR"] ?? "false";
-const PEERS: string[] = (process.env["PEERS"] ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// ── Configuration ─────────────────────────────────────────────────
+const config = loadConfig();
 
-const VALIDATOR_INTERVAL_MS: number =
-  parseInt(process.env["VALIDATOR_INTERVAL_MS"] ?? "15000", 5);
+// ── Core singletons ───────────────────────────────────────────────
+// These objects hold ALL in-memory state for this node. They are created
+// once and shared across the HTTP handlers, mining loop, and message
+// bus subscriptions.
+const blockchain    = new Blockchain();
+const txPool        = new TransactionPool();
+const electionState = new State();       // tracks who has already voted
+const election      = new Election();    // holds the current election config
+const messageBus    = new MessageBus(config.nodeName);
 
-// ─── Core singletons ───────────────────────────────────────────────
-const blockchain = new Blockchain();
-const txPool = new TransactionPool();
-const electionState = new State();
-const election = new Election();
-const p2pNetwork = new P2PNetwork(blockchain, txPool, election, NODE_NAME);
-
-// Tally from the last completed election — set just before auto-wipe runs,
-// so the GUI can still fetch results after the chain has been cleared.
+// Stores the tally from the last completed election so the Gateway can
+// serve GET /api/election/results even after the chain has been wiped.
 let lastTally: Record<string, number> | null = null;
 
-// ─── Express application ────────────────────────────────────────────
+// ── Chain sync service ────────────────────────────────────────────
+// Wires the sync logic to the message bus: when a block is appended we
+// publish it, and when we need the full chain we ask the bus to fetch it.
+const chainSync = new ChainSyncService(
+  blockchain,
+  txPool,
+  config.nodeName,
+  (block: IBlock) => messageBus.publishBlock(block),
+  ()              => messageBus.requestFullChain(),
+);
+
+// Gossip service: parses raw vote payloads and adds them to the mempool.
+const gossipService = new TransactionGossipService(txPool, config.nodeName);
+
+// ── Express application ────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-/**
- * Serve the web GUI from the `public/` directory.
- *
- * In the Dockerfile, `public/` is copied next to `dist/`, so the
- * resolved path is `../public` relative to `dist/server.js`.
- * When running via ts-node from `src/`, it resolves to `../public`
- * relative to `src/server.ts` — same relative hop.
- */
+// Serve the voter and admin UIs from the public/ directory.
+// In the container the path resolves to /app/public/ (see Dockerfile).
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-// ══════════════════════════════════════════════════════════════════════
-//  HTTP ROUTES (inline — no separate api/ module)
-// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+//  HTTP ROUTES
+// ══════════════════════════════════════════════════════════════════
 
-// ─── GET / — Health-check ───────────────────────────────────────────
+// ── GET /api/health ── node liveness check ──────────────────────
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({
-    status: "Node is alive",
-    node: NODE_NAME,
-    isValidator: IS_VALIDATOR,
-    uptime: process.uptime(),
+    status:      "Node is alive",
+    node:        config.nodeName,
+    isValidator: config.isValidator,
+    uptime:      process.uptime(),
   });
 });
 
-// ─── GET /api/blocks — Full blockchain ──────────────────────────────
+// ── GET /api/blocks ── full blockchain ─────────────────────────
 app.get("/api/blocks", (_req: Request, res: Response) => {
   res.json({
-    node: NODE_NAME,
-    length: blockchain.chain.length,
-    isValid: blockchain.isChainValid(),
-    blocks: blockchain.chain,
+    node:     config.nodeName,
+    length:   blockchain.chain.length,
+    isValid:  blockchain.isChainValid(),
+    blocks:   blockchain.chain,
   });
 });
 
-// ─── GET /api/pool — Mempool contents ───────────────────────────────
+// ── GET /api/pool ── mempool contents ──────────────────────────
 app.get("/api/pool", (_req: Request, res: Response) => {
   res.json({
-    node: NODE_NAME,
+    node:         config.nodeName,
     pendingCount: txPool.size,
     transactions: txPool.getTransactions(),
   });
 });
 
-// ─── GET /api/peers — P2P peer info ─────────────────────────────────
+// ── GET /api/peers ── message bus status ───────────────────────
+// Previously returned WebSocket peer counts. Now reports RabbitMQ
+// connection status since the P2P layer no longer exists.
 app.get("/api/peers", (_req: Request, res: Response) => {
   res.json({
-    node: NODE_NAME,
-    connectedPeers: p2pNetwork.getPeerCount(),
-    configuredPeers: PEERS,
+    node:       config.nodeName,
+    messageBus: messageBus.isConnected ? "connected" : "disconnected",
+    // Mask credentials from the URL before returning it to the client.
+    brokerUrl:  config.rabbitmqUrl.replace(/:\/\/[^@]*@/, "://***@"),
   });
 });
 
-// ─── GET /api/election — Current election state ─────────────────────
+// ── GET /api/election ── current election config ────────────────
 app.get("/api/election", (_req: Request, res: Response) => {
-  const config = election.getConfig();
-  if (!config) {
+  const cfg = election.getConfig();
+  if (!cfg) {
     res.status(404).json({ error: "No active election." });
     return;
   }
-  res.json({ node: NODE_NAME, election: config });
+  res.json({ node: config.nodeName, election: cfg });
 });
 
-// ─── GET /api/election/status — Lightweight status for voter UI ──────
-/**
- * Returns the minimal shape the Voter UI needs to decide whether to
- * show the ballot form. Reads directly from the in-memory Election
- * singleton (which is populated from the Genesis-Block-style config
- * broadcast to every node at election start).
- *
- * Response:
- *   { isActive: false }                              — no election
- *   { isActive: true, electionId, candidates,
- *     endTime, whitelist }                           — live election
- */
+// ── GET /api/election/status ── lightweight status for the voter UI
+// Returns only the fields the ballot form needs so the UI doesn't have
+// to parse the full election object.
 app.get("/api/election/status", (_req: Request, res: Response) => {
-  const config = election.getConfig();
-  if (!config || !config.isActive) {
+  const cfg = election.getConfig();
+  if (!cfg || !cfg.isActive) {
     res.json({ isActive: false });
     return;
   }
   res.json({
-    isActive: true,
-    electionId: config.electionId,
-    candidates: config.candidates,
-    endTime: config.endTime,
-    whitelist: config.whitelist,
+    isActive:      true,
+    electionId:    cfg.electionId,
+    type:          cfg.type,
+    candidates:    cfg.candidates,
+    endTime:       cfg.endTime,
+    whitelist:     cfg.whitelist,
+    ...(cfg.question      ? { question:      cfg.question }      : {}),
+    ...(cfg.maxSelections ? { maxSelections: cfg.maxSelections } : {}),
   });
 });
 
-// ─── GET /api/election/results — Tally from last completed election ──
-/**
- * Returns the vote counts computed just before the auto-wipe ran.
- * Safe to call after the chain has been wiped — the tally lives in
- * memory until the next election starts or the process restarts.
- */
+// ── GET /api/election/results ── tally from the last completed election
+// The tally is computed just before the auto-wipe runs and stored in
+// `lastTally`. It remains available until the next election starts.
 app.get("/api/election/results", (_req: Request, res: Response) => {
   if (!lastTally) {
     res.json({ available: false });
     return;
   }
-  const total = Object.values(lastTally).reduce((a, b) => a + b, 0);
-  const sorted = Object.entries(lastTally).sort((a, b) => b[1] - a[1]);
+  const total  = Object.values(lastTally).reduce((a, b) => a + b, 0);
+  const sorted = Object.entries(lastTally).sort(([, a], [, b]) => b - a);
   const winner = sorted[0]?.[0] ?? null;
   res.json({ available: true, winner, total, tally: lastTally });
 });
 
-// ─── POST /api/election — Create a new single-use election ─────────
+// ── POST /api/election ── create a new election (Gateway only) ──
 /**
- * NO ADMIN KEY — simplified for thesis demo.
+ * NO ADMIN KEY — simplified for the thesis demo.
  *
- * The request body carries the plain election parameters:
- *   { candidates: string[], whitelist: string[], durationSeconds: number }
+ * Request body:
+ *   {
+ *     type?:            "single-choice" | "multiple-choice" | "yes-no",
+ *     candidates:       string[],   // ignored if type === "yes-no"
+ *     whitelist:        string[],
+ *     durationSeconds:  number,
+ *     question?:        string,     // yes-no only (the referendum prompt)
+ *     maxSelections?:   number,     // multiple-choice only (defaults to N)
+ *   }
  *
- * The server computes endTime, activates the election in memory,
- * broadcasts the config to all peers via P2P, and schedules the
- * auto-wipe timer.
+ * On success, activates the election on this node, broadcasts the config
+ * to all peers via RabbitMQ, and schedules the auto-wipe timer.
  */
 app.post("/api/election", (req: Request, res: Response) => {
-  const { candidates, whitelist, durationSeconds } = req.body;
+  const {
+    type,
+    candidates,
+    whitelist,
+    durationSeconds,
+    question,
+    maxSelections,
+  } = req.body as {
+    type?: unknown;
+    candidates: unknown;
+    whitelist: unknown;
+    durationSeconds: unknown;
+    question?: unknown;
+    maxSelections?: unknown;
+  };
 
-  // ── Basic validation ──────────────────────────────────────────────
-  if (!Array.isArray(candidates) || candidates.length === 0) {
-    res.status(400).json({ error: "candidates must be a non-empty array." });
-    return;
-  }
+  // ── Type discriminator ─────────────────────────────────────────
+  const electionType: ElectionType =
+    type === "multiple-choice" || type === "yes-no" ? type : "single-choice";
+
+  // ── Always-required fields ─────────────────────────────────────
   if (!Array.isArray(whitelist) || whitelist.length === 0) {
     res.status(400).json({ error: "whitelist must be a non-empty array." });
     return;
@@ -219,174 +235,114 @@ app.post("/api/election", (req: Request, res: Response) => {
     return;
   }
 
-  // ── Build election config ─────────────────────────────────────────
-  const endTime = Date.now() + durationSeconds * 1000;
-  const electionId = `election-${Date.now()}`;
-
-  // Clear results from previous election
-  lastTally = null;
-
-  election.activate({ electionId, candidates, whitelist, endTime });
-
-  // ── Broadcast to all peers so Validators know the rules ───────────
-  const config = election.getConfig()!;
-  p2pNetwork.broadcast(electionCreatedMsg(config));
-
-  console.log(
-    `[${NODE_NAME}] ✔ Election "${electionId}" started. ` +
-    `Duration: ${durationSeconds}s, Candidates: [${candidates.join(", ")}], ` +
-    `Whitelist size: ${whitelist.length}`,
-  );
-
-  // ──────────────────────────────────────────────────────────────────
-  //  AUTO-WIPE TIMER
-  // ──────────────────────────────────────────────────────────────────
-  //
-  //  This setTimeout fires when the election window closes. It:
-  //    1. Tallies votes from the immutable blockchain.
-  //    2. Wipes all blocks from MongoDB (fresh slate for next demo).
-  //    3. Resets in-memory chain, mempool, double-vote set.
-  //    4. Deactivates the election.
-  //
-  //  WHY AUTO-WIPE?
-  //  In a thesis defence, the examiner wants to see a complete election
-  //  lifecycle in ~60 seconds, then immediately start another one. The
-  //  auto-wipe makes this possible without restarting containers or
-  //  manually clearing databases. It turns the prototype into a
-  //  "single-use, infinitely repeatable" demo system.
-  //
-  //  WHY TALLY FROM THE CHAIN (NOT A COUNTER)?
-  //  The blockchain is the single source of truth. Reading votes from
-  //  sealed, hash-linked blocks guarantees determinism, auditability,
-  //  and tamper-evidence — core blockchain properties we want to
-  //  demonstrate in the thesis.
-  // ──────────────────────────────────────────────────────────────────
-  setTimeout(async () => {
-    console.log(
-      `\n[${NODE_NAME}] ══════════════════════════════════════════════════\n` +
-      `[${NODE_NAME}]  ELECTION TALLY — "${electionId}"\n` +
-      `[${NODE_NAME}] ══════════════════════════════════════════════════`,
-    );
-
-    // ── Step 1: Tally votes from the immutable chain ────────────────
-    const allVotes: Vote[] = [];
-    for (const block of blockchain.chain) {
-      for (const tx of block.transactions) {
-        allVotes.push(tx);
+  // ── Candidate / question rules per type ────────────────────────
+  if (electionType === "yes-no") {
+    if (typeof question !== "string" || question.trim().length === 0) {
+      res.status(400).json({ error: "yes-no elections require a non-empty 'question'." });
+      return;
+    }
+  } else {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      res.status(400).json({ error: "candidates must be a non-empty array." });
+      return;
+    }
+    if ((candidates as string[]).some((c) => c.includes(MULTI_CHOICE_SEPARATOR))) {
+      res.status(400).json({
+        error: `Candidate names must not contain the "${MULTI_CHOICE_SEPARATOR}" character.`,
+      });
+      return;
+    }
+    if (electionType === "multiple-choice" && maxSelections !== undefined) {
+      if (
+        typeof maxSelections !== "number" ||
+        maxSelections < 1 ||
+        maxSelections > (candidates as string[]).length
+      ) {
+        res.status(400).json({
+          error: `maxSelections must be a number between 1 and ${(candidates as string[]).length}.`,
+        });
+        return;
       }
     }
+  }
 
-    const electionVotes = allVotes.filter((v) => v.electionId === electionId);
-    const tallyMap = new Map<string, number>();
-    for (const c of candidates) tallyMap.set(c, 0);
-    for (const v of electionVotes) {
-      tallyMap.set(v.candidateId, (tallyMap.get(v.candidateId) ?? 0) + 1);
-    }
+  const endTime    = Date.now() + durationSeconds * 1000;
+  const electionId = `election-${Date.now()}`;
 
-    const sorted = [...tallyMap.entries()].sort((a, b) => b[1] - a[1]);
-    lastTally = Object.fromEntries(tallyMap);  // capture before the wipe
-    console.log(`[${NODE_NAME}]  Total votes on chain: ${allVotes.length}`);
-    console.log(`[${NODE_NAME}]  Votes for this election: ${electionVotes.length}`);
-    console.log(`[${NODE_NAME}]  ──────────────────────────────────────────`);
-    for (const [candidate, count] of sorted) {
-      const pct = electionVotes.length > 0
-        ? ((count / electionVotes.length) * 100).toFixed(1)
-        : "0.0";
-      console.log(`[${NODE_NAME}]    ${candidate}: ${count} vote(s) (${pct}%)`);
-    }
-    if (sorted.length > 0 && sorted[0]) {
-      console.log(
-        `[${NODE_NAME}]  ──────────────────────────────────────────\n` +
-        `[${NODE_NAME}]  🏆 WINNER: ${sorted[0][0]} with ${sorted[0][1]} vote(s)\n` +
-        `[${NODE_NAME}] ══════════════════════════════════════════════════\n`,
-      );
-    }
+  lastTally = null; // clear results from any previous election
 
-    // ── Step 2: Wipe MongoDB blocks (fresh slate for next demo) ─────
-    //
-    // AUTO-WIPE: deleting all blocks from the database so the next
-    // election starts with a clean chain. This is the key mechanism
-    // that makes the demo infinitely repeatable.
-    try {
-      const deleted = await BlockModel.deleteMany({});
-      console.log(`[${NODE_NAME}] 🗑 Auto-wipe: deleted ${deleted.deletedCount} block(s) from MongoDB.`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[${NODE_NAME}] Auto-wipe DB delete failed: ${msg}`);
-    }
-
-    // ── Step 3: Reset in-memory state ───────────────────────────────
-    //
-    // AUTO-WIPE: reset the in-memory blockchain to just the genesis
-    // block, clear the mempool, and clear the double-vote tracker.
-    blockchain.resetToGenesis();
-    txPool.clearPool();
-    electionState.clear();
-    election.deactivate();
-
-    // Re-persist genesis for the fresh chain
-    const genesisBlock = blockchain.chain[0]!;
-    try {
-      await BlockModel.create({
-        index: genesisBlock.index,
-        timestamp: genesisBlock.timestamp,
-        transactions: genesisBlock.transactions,
-        previousHash: genesisBlock.previousHash,
-        hash: genesisBlock.hash,
-        nonce: genesisBlock.nonce,
-      });
-      console.log(`[${NODE_NAME}] ✔ Fresh genesis block persisted after auto-wipe.`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[${NODE_NAME}] Failed to re-persist genesis: ${msg}`);
-    }
-
-    console.log(`[${NODE_NAME}] ✔ Auto-wipe complete. Ready for a new election.\n`);
-  }, durationSeconds * 1000);
-
-  res.status(201).json({
-    message: "Election created and broadcast.",
-    election: config,
+  election.activate({
+    electionId,
+    type:       electionType,
+    candidates: electionType === "yes-no" ? [] : (candidates as string[]),
+    whitelist:  whitelist as string[],
+    endTime,
+    ...(electionType === "yes-no"
+      ? { question: (question as string).trim() }
+      : {}),
+    ...(electionType === "multiple-choice" && typeof maxSelections === "number"
+      ? { maxSelections }
+      : {}),
   });
+
+  const cfg = election.getConfig()!;
+
+  // Broadcast the election config to all Validators via RabbitMQ.
+  messageBus.publishElection(cfg);
+
+  console.log(
+    `[${config.nodeName}] Election "${electionId}" started ` +
+    `(type: ${cfg.type}). ` +
+    `Duration: ${durationSeconds}s, Candidates: [${cfg.candidates.join(", ")}], ` +
+    `Whitelist: ${(whitelist as string[]).length} address(es)` +
+    (cfg.maxSelections ? `, maxSelections: ${cfg.maxSelections}` : "") +
+    (cfg.question      ? `, question: "${cfg.question}"`          : "") +
+    `.`,
+  );
+
+  // Schedule the auto-wipe for the Gateway.
+  // Validators schedule their own wipe when they receive the ELECTION message.
+  scheduleAutoWipe(cfg, durationSeconds * 1000, (tally) => {
+    lastTally = tally; // save tally so results endpoint keeps working after wipe
+  });
+
+  res.status(201).json({ message: "Election created and broadcast.", election: cfg });
 });
 
-// ─── POST /api/vote — Submit a signed vote ──────────────────────────
+// ── POST /api/vote ── submit a signed vote ──────────────────────
 /**
  * VALIDATION PIPELINE (3 layers):
- *   Layer 1 — Election rules (whitelist, candidate, time window).
- *   Layer 2 — Double-vote prevention (State Set<string>).
- *   Layer 3 — ECDSA signature verification (ethers.verifyMessage).
+ *   1. Election rules — active election, time window, whitelist, valid candidate.
+ *   2. Double-vote prevention — in-memory State set keyed by voter address.
+ *   3. ECDSA signature — ethers.verifyMessage recovers the signer address and
+ *      compares it against senderPublicKey.
  */
 app.post("/api/vote", (req: Request, res: Response) => {
-  const vote = req.body;
+  const vote = req.body as Vote;
 
-  // ── Layer 1: Election rules ─────────────────────────────────────
+  // Layer 1: election rules
   const check = election.isVoteValid(vote);
   if (!check.valid) {
     res.status(400).json({ error: check.reason });
     return;
   }
 
-  // ── Layer 2: Double-vote prevention ─────────────────────────────
+  // Layer 2: double-vote prevention
   if (electionState.hasVoted(vote.senderPublicKey)) {
     res.status(400).json({ error: "This address has already voted." });
     return;
   }
 
-  // ── Layer 3: ECDSA signature verification ───────────────────────
+  // Layer 3: ECDSA signature verification
   try {
     const { senderPublicKey, candidateId, electionId, timestamp, signature } = vote;
 
-    const canonicalPayload = JSON.stringify({
-      senderPublicKey,
-      candidateId,
-      electionId,
-      timestamp,
-    });
+    // The canonical payload is identical to what the client signed.
+    // JSON.stringify key order must match exactly — see voter UI.
+    const payload = JSON.stringify({ senderPublicKey, candidateId, electionId, timestamp });
 
-    const recoveredAddress: string = ethers.verifyMessage(canonicalPayload, signature);
-
-    if (recoveredAddress.toLowerCase() !== senderPublicKey.toLowerCase()) {
+    const recovered: string = ethers.verifyMessage(payload, signature);
+    if (recovered.toLowerCase() !== senderPublicKey.toLowerCase()) {
       res.status(400).json({ error: "Invalid signature." });
       return;
     }
@@ -395,111 +351,242 @@ app.post("/api/vote", (req: Request, res: Response) => {
     return;
   }
 
-  // ── Accepted → mempool + gossip ─────────────────────────────────
+  // All checks passed — record the vote and broadcast it.
   electionState.markVoted(vote.senderPublicKey);
   txPool.addTransaction(vote);
-  p2pNetwork.broadcast(broadcastTransactionMsg(vote));
+  messageBus.publishVote(vote);
 
   console.log(
-    `[${NODE_NAME}] ✔ Vote accepted from ${vote.senderPublicKey} ` +
-    `(pool: ${txPool.size}, voters: ${electionState.voterCount}).`,
+    `[${config.nodeName}] Vote accepted from ${vote.senderPublicKey.slice(0, 10)}… ` +
+    `(pool: ${txPool.size}, unique voters: ${electionState.voterCount}).`,
   );
 
   res.status(200).json({ message: "Vote accepted." });
 });
 
-// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+//  AUTO-WIPE HELPER
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * Schedule the post-election cleanup for this node.
+ *
+ * Both the Gateway (from POST /api/election) and Validators (from the
+ * ELECTION message subscription) call this function so the cleanup
+ * always fires at the right time regardless of node role.
+ *
+ * Steps (run after delayMs):
+ *   1. Optional: compute and pass the tally to `onPreWipe` (Gateway only).
+ *   2. Delete all blocks from MongoDB.
+ *   3. Reset the in-memory chain to genesis.
+ *   4. Clear the mempool and voter-address set.
+ *   5. Re-persist the fresh genesis block so MongoDB and memory stay in sync.
+ *
+ * @param cfg         The election config (used to scope the vote tally).
+ * @param delayMs     Milliseconds until the wipe fires.
+ * @param onPreWipe   Optional callback that receives the final tally before
+ *                    the chain is wiped (used by the Gateway to store results).
+ */
+function scheduleAutoWipe(
+  cfg: ElectionConfig,
+  delayMs: number,
+  onPreWipe?: (tally: Record<string, number>) => void,
+): void {
+  setTimeout(async () => {
+    console.log(
+      `\n[${config.nodeName}] ══ AUTO-WIPE: election "${cfg.electionId}" ══`,
+    );
+
+    // ── Step 1: Tally ─────────────────────────────────────────────
+    if (onPreWipe) {
+      // Collect every vote from every block, filtered to this election.
+      const votes: Vote[] = blockchain.chain.flatMap((b) => b.transactions);
+      const electionVotes = votes.filter((v) => v.electionId === cfg.electionId);
+
+      // Initial buckets depend on the election type.
+      //   single-choice / multiple-choice: one bucket per candidate.
+      //   yes-no:                          two buckets, "yes" and "no".
+      const initialBuckets: [string, number][] =
+        cfg.type === "yes-no"
+          ? [["yes", 0], ["no", 0]]
+          : cfg.candidates.map((c) => [c, 0]);
+
+      const tally = new Map<string, number>(initialBuckets);
+
+      // Count selections from every sealed ballot.
+      // For multiple-choice, a single ballot contributes one point to
+      // each candidate it approved (approval voting) — so we split the
+      // pipe-delimited candidateId.
+      for (const v of electionVotes) {
+        const selections =
+          cfg.type === "multiple-choice"
+            ? v.candidateId.split(MULTI_CHOICE_SEPARATOR)
+            : [v.candidateId];
+
+        for (const sel of selections) {
+          if (tally.has(sel)) {
+            tally.set(sel, tally.get(sel)! + 1);
+          }
+        }
+      }
+
+      const sorted = [...tally.entries()].sort(([, a], [, b]) => b - a);
+      console.log(`[${config.nodeName}]  Election type: ${cfg.type}`);
+      console.log(`[${config.nodeName}]  Total ballots sealed on chain: ${electionVotes.length}`);
+      const denominator =
+        cfg.type === "multiple-choice"
+          ? [...tally.values()].reduce((a, b) => a + b, 0) // total approvals
+          : electionVotes.length;
+      for (const [option, count] of sorted) {
+        const pct = denominator > 0
+          ? ((count / denominator) * 100).toFixed(1)
+          : "0.0";
+        console.log(`[${config.nodeName}]    ${option}: ${count} (${pct}%)`);
+      }
+      if (sorted[0]) {
+        console.log(`[${config.nodeName}]  Winner: ${sorted[0][0]} with ${sorted[0][1]} point(s)`);
+      }
+
+      onPreWipe(Object.fromEntries(tally));
+    }
+
+    // ── Step 2: Wipe MongoDB ──────────────────────────────────────
+    try {
+      const { deletedCount } = await BlockModel.deleteMany({});
+      console.log(`[${config.nodeName}]  Deleted ${deletedCount} block(s) from MongoDB.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${config.nodeName}]  MongoDB wipe failed: ${msg}`);
+    }
+
+    // ── Step 3: Reset in-memory state ────────────────────────────
+    blockchain.resetToGenesis();
+    txPool.clearPool();
+    electionState.clear();
+    election.deactivate();
+
+    // ── Step 4: Re-persist genesis ────────────────────────────────
+    // After resetToGenesis(), chain[0] is a fresh genesis block.
+    // We persist it immediately so MongoDB never ends up empty.
+    const genesis = blockchain.chain[0]!;
+    try {
+      await BlockModel.create(genesis.toJSON());
+      console.log(`[${config.nodeName}]  Fresh genesis block persisted.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${config.nodeName}]  Failed to persist genesis: ${msg}`);
+    }
+
+    console.log(`[${config.nodeName}] ══ AUTO-WIPE COMPLETE. Ready for next election. ══\n`);
+  }, delayMs);
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  BOOT SEQUENCE
-// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
 
 async function main(): Promise<void> {
-  await connectToDatabase(MONGO_URI);
+  // ── 1. MongoDB ────────────────────────────────────────────────
+  await connectToDatabase(config.mongoUri);
 
-  // Wipe any stale blocks from a previous run so the in-memory chain
-  // (which always starts at genesis) stays in sync with MongoDB.
-  try {
-    const stale = await BlockModel.deleteMany({});
-    if (stale.deletedCount > 0) {
-      console.log(
-        `[${NODE_NAME}] 🗑 Boot wipe: removed ${stale.deletedCount} stale block(s) from MongoDB.`,
-      );
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[${NODE_NAME}] Boot wipe failed: ${msg}`);
+  // Remove any blocks left from a previous process run. The in-memory
+  // chain always starts from a fresh genesis, so stale DB blocks would
+  // cause a mismatch between memory and persistence.
+  const { deletedCount: stale } = await BlockModel.deleteMany({});
+  if (stale > 0) {
+    console.log(`[${config.nodeName}] Boot: removed ${stale} stale block(s) from MongoDB.`);
   }
 
-  // Persist the fresh genesis block
-  const genesisBlock = blockchain.chain[0]!;
-  try {
-    await BlockModel.create({
-      index: genesisBlock.index,
-      timestamp: genesisBlock.timestamp,
-      transactions: genesisBlock.transactions,
-      previousHash: genesisBlock.previousHash,
-      hash: genesisBlock.hash,
-      nonce: genesisBlock.nonce,
-    });
-    console.log(`[${NODE_NAME}] ✔ Genesis block persisted (hash: ${genesisBlock.hash}).`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[${NODE_NAME}] Genesis persist failed: ${msg}`);
-    throw err;
-  }
+  // Persist the in-memory genesis block so MongoDB is never empty.
+  const genesis = blockchain.chain[0]!;
+  await BlockModel.create(genesis.toJSON());
+  console.log(`[${config.nodeName}] Genesis block persisted (hash: ${genesis.hash.slice(0, 12)}…).`);
 
-  // Start P2P
-  p2pNetwork.startServer(P2P_PORT);
+  // ── 2. RabbitMQ ───────────────────────────────────────────────
+  await messageBus.connect(config.rabbitmqUrl);
 
-  if (PEERS.length > 0) {
-    console.log(`[${NODE_NAME}] Connecting to ${PEERS.length} seed peer(s)...`);
-    setTimeout(() => p2pNetwork.connectToPeers(PEERS), 5000);
-  }
+  // ── 3. Message bus subscriptions ─────────────────────────────
 
-  // Start HTTP
-  app.listen(PORT, () => {
-    console.log(`[${NODE_NAME}] Server running on port ${PORT}`);
-    console.log(`[${NODE_NAME}] Role: ${IS_VALIDATOR === "true" ? "VALIDATOR" : "GATEWAY"}`);
-    console.log(`[${NODE_NAME}] P2P port: ${P2P_PORT} | Seed peers: ${PEERS.length}`);
+  // All nodes (Gateway and Validators) subscribe to election messages
+  // so every node enforces identical election rules.
+  await messageBus.subscribeToElections((cfg: ElectionConfig) => {
+    console.log(`[${config.nodeName}] Received ELECTION "${cfg.electionId}" — activating.`);
+    election.activate(cfg);
+
+    // Validators schedule their own auto-wipe timer here.
+    // (The Gateway already scheduled it in POST /api/election.)
+    const delay = Math.max(0, cfg.endTime - Date.now());
+    scheduleAutoWipe(cfg, delay);
   });
 
-  // ── Validator mining loop ─────────────────────────────────────────
-  if (IS_VALIDATOR === "true") {
+  // All nodes subscribe to block messages to keep their chains in sync.
+  await messageBus.subscribeToBlocks((block: IBlock, fromNode: string) => {
     console.log(
-      `[${NODE_NAME}] ⛏ Validator mining loop started (interval: ${VALIDATOR_INTERVAL_MS / 1000}s).`,
+      `[${config.nodeName}] Received BLOCK ${block.index} from ${fromNode}.`,
+    );
+    chainSync.handleReceivedBlock(JSON.stringify(block));
+  });
+
+  // All nodes respond to chain sync requests so any node that falls behind
+  // can recover its chain.
+  await messageBus.subscribeToChainRequests(async (replyQueue: string) => {
+    console.log(`[${config.nodeName}] Received CHAIN_REQUEST — responding with full chain.`);
+    await messageBus.publishChainResponse(replyQueue, blockchain.chain);
+  });
+
+  // Validators subscribe to vote messages to populate their mempool.
+  // The Gateway does NOT subscribe here — it adds votes to the pool
+  // directly in POST /api/vote before publishing to RabbitMQ, to
+  // avoid adding the same vote twice.
+  if (config.isValidator) {
+    await messageBus.subscribeToVotes((vote: Vote) => {
+      gossipService.handleIncomingVote(JSON.stringify(vote));
+    });
+  }
+
+  // ── 4. HTTP server ────────────────────────────────────────────
+  app.listen(config.httpPort, () => {
+    console.log(`[${config.nodeName}] HTTP server on port ${config.httpPort}.`);
+    console.log(`[${config.nodeName}] Role: ${config.isValidator ? "VALIDATOR" : "GATEWAY"}.`);
+  });
+
+  // ── 5. Validator mining loop ──────────────────────────────────
+  if (config.isValidator) {
+    console.log(
+      `[${config.nodeName}] Mining loop started ` +
+      `(interval: ${config.validatorIntervalMs / 1000}s).`,
     );
 
     setInterval(async () => {
+      // Skip this cycle if there is nothing to seal.
       if (txPool.size === 0) return;
 
-      console.log(`[${NODE_NAME}] ⛏ Mining — ${txPool.size} pending vote(s).`);
+      console.log(`[${config.nodeName}] Mining — ${txPool.size} pending vote(s).`);
 
       try {
-        const pendingVotes = txPool.getTransactions();
+        // Drain the pool BEFORE building the block so votes that arrive
+        // during the async DB write don't get dropped on the next cycle.
+        const votes = txPool.getTransactions();
         txPool.clearPool();
 
-        const newBlock = blockchain.addBlock(pendingVotes);
+        const newBlock = blockchain.addBlock(votes);
 
-        await BlockModel.create({
-          index: newBlock.index,
-          timestamp: newBlock.timestamp,
-          transactions: newBlock.transactions,
-          previousHash: newBlock.previousHash,
-          hash: newBlock.hash,
-          nonce: newBlock.nonce,
-        });
+        // Persist the block to MongoDB.
+        await BlockModel.create(newBlock.toJSON());
         console.log(
-          `[${NODE_NAME}] ⛏ Block ${newBlock.index} mined ` +
-          `(${pendingVotes.length} vote(s), hash: ${newBlock.hash}).`,
+          `[${config.nodeName}] Block ${newBlock.index} mined and persisted ` +
+          `(${votes.length} vote(s), hash: ${newBlock.hash.slice(0, 12)}…).`,
         );
 
-        p2pNetwork.broadcast(responseBlockchainMsg([newBlock]));
+        // Broadcast the new block to all peers via RabbitMQ.
+        messageBus.publishBlock(newBlock);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[${NODE_NAME}] ⛏ Mining failed: ${msg}`);
+        console.error(`[${config.nodeName}] Mining failed: ${msg}`);
       }
-    }, VALIDATOR_INTERVAL_MS);
+    }, config.validatorIntervalMs);
   } else {
-    console.log(`[${NODE_NAME}] ℹ Running as GATEWAY — no mining loop.`);
+    console.log(`[${config.nodeName}] Running as GATEWAY — mining loop not started.`);
   }
 }
 

@@ -98,8 +98,30 @@
     <div class="card">
       <h2>🛠 Admin Panel</h2>
 
-      <label for="candidates">Candidates (comma-separated)</label>
-      <input id="candidates" placeholder="e.g. Alice, Bob, Charlie" />
+      <label for="election-type">Election Format</label>
+      <select id="election-type">
+        <option value="single-choice">Single-choice (pick one)</option>
+        <option value="multiple-choice">Multiple-choice (approval voting)</option>
+        <option value="yes-no">Yes / No (referendum)</option>
+      </select>
+
+      <!-- Candidate-list group: shown for single & multiple choice -->
+      <div id="candidates-group">
+        <label for="candidates">Candidates (comma-separated)</label>
+        <input id="candidates" placeholder="e.g. Alice, Bob, Charlie" />
+      </div>
+
+      <!-- Multi-choice extra: max selections allowed per voter -->
+      <div id="max-selections-group" style="display:none;">
+        <label for="max-selections">Max selections per voter</label>
+        <input id="max-selections" type="number" value="2" min="1" />
+      </div>
+
+      <!-- Yes-no extra: the referendum question -->
+      <div id="question-group" style="display:none;">
+        <label for="question">Referendum Question</label>
+        <input id="question" placeholder="e.g. Should we adopt the new charter?" />
+      </div>
 
       <label for="whitelist">Voter Whitelist (one address per line)</label>
       <textarea id="whitelist" placeholder="0xAbc123…&#10;0xDef456…"></textarea>

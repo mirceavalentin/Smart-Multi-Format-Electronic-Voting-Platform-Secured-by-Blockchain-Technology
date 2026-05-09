@@ -18,7 +18,7 @@ describe("TransactionGossipService", () => {
       signature: "0xsig",
     };
 
-    service.handleBroadcastTransaction(JSON.stringify(vote));
+    service.handleIncomingVote(JSON.stringify(vote));
 
     expect(addTransaction).toHaveBeenCalledTimes(1);
     expect(addTransaction).toHaveBeenCalledWith(vote);
@@ -34,7 +34,7 @@ describe("TransactionGossipService", () => {
     const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
 
     const service = new TransactionGossipService(txPool as any, "unit-node");
-    service.handleBroadcastTransaction("not-json");
+    service.handleIncomingVote("not-json");
 
     expect(addTransaction).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalled();

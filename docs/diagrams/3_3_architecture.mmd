@@ -1,0 +1,84 @@
+%% =============================================================================
+%%  Section 3.3 — General architecture
+%%  Gateway, three Validators, RabbitMQ HA cluster, MongoDB per node.
+%%  Mirrors podman-compose.yml (4 app containers + 3 RabbitMQ + 4 MongoDB).
+%% =============================================================================
+
+flowchart TB
+    %% ── Clients ──────────────────────────────────────────────────────────
+    subgraph Clients["Browser clients"]
+        Voter["Voter UI<br/>public/index.html<br/>public/voter.js<br/>+ MetaMask wallet"]
+        Admin["Admin UI<br/>public/admin.html<br/>public/admin.js"]
+    end
+
+    %% ── Gateway (Node A) ─────────────────────────────────────────────────
+    subgraph GatewayNode["Gateway — Node A (IS_VALIDATOR=false)"]
+        direction TB
+        GatewayApp["Express HTTP server<br/>src/server.ts<br/>port 3000 (exposed)<br/>3-layer vote validation"]
+        GatewayMongo[("MongoDB A<br/>:27017<br/>BlockModel")]
+        GatewayApp -- "Mongoose" --> GatewayMongo
+    end
+
+    %% ── Validators ───────────────────────────────────────────────────────
+    subgraph Validators["Validators — internal only (IS_VALIDATOR=true)"]
+        direction TB
+
+        subgraph V1["Validator 1"]
+            V1App["Express + mining loop<br/>setInterval(VALIDATOR_INTERVAL_MS)"]
+            V1Mongo[("MongoDB 1<br/>:27018")]
+            V1App -- "Mongoose" --> V1Mongo
+        end
+
+        subgraph V2["Validator 2"]
+            V2App["Express + mining loop"]
+            V2Mongo[("MongoDB 2<br/>:27019")]
+            V2App -- "Mongoose" --> V2Mongo
+        end
+
+        subgraph V3["Validator 3"]
+            V3App["Express + mining loop"]
+            V3Mongo[("MongoDB 3<br/>:27020")]
+            V3App -- "Mongoose" --> V3Mongo
+        end
+    end
+
+    %% ── RabbitMQ HA cluster ──────────────────────────────────────────────
+    subgraph RabbitMQ["RabbitMQ HA cluster (3 nodes, shared Erlang cookie)"]
+        direction LR
+        RMQ1["rabbitmq-1<br/>PRIMARY<br/>:5672 AMQP<br/>:15672 Mgmt UI"]
+        RMQ2["rabbitmq-2<br/>replica"]
+        RMQ3["rabbitmq-3<br/>replica"]
+        RMQ1 <-- "metadata sync" --> RMQ2
+        RMQ2 <-- "metadata sync" --> RMQ3
+        RMQ1 <-- "metadata sync" --> RMQ3
+
+        subgraph Exchanges["Fanout exchanges (durable)"]
+            EX1["voting.votes"]
+            EX2["voting.election"]
+            EX3["voting.blocks"]
+            EX4["voting.chain-req"]
+        end
+    end
+
+    %% ── HTTP traffic ─────────────────────────────────────────────────────
+    Voter      -- "HTTPS<br/>POST /api/vote<br/>GET /api/election/status<br/>GET /api/election/results" --> GatewayApp
+    Admin      -- "HTTPS<br/>POST /api/election (type, candidates,<br/>question?, maxSelections?, whitelist, duration)<br/>GET /api/blocks · /api/pool · /api/peers" --> GatewayApp
+
+    %% ── AMQP traffic ─────────────────────────────────────────────────────
+    GatewayApp <-- "AMQP 5672<br/>publish: VOTE, ELECTION<br/>subscribe: BLOCK, CHAIN_REQUEST" --> RMQ1
+    V1App      <-- "AMQP 5672<br/>publish: BLOCK, CHAIN_REQUEST/RESPONSE<br/>subscribe: VOTE, ELECTION, BLOCK, CHAIN_REQUEST" --> RMQ1
+    V2App      <-- "AMQP 5672" --> RMQ1
+    V3App      <-- "AMQP 5672" --> RMQ1
+
+    %% ── Styling ──────────────────────────────────────────────────────────
+    classDef gateway   fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#0d47a1
+    classDef validator fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#bf360c
+    classDef broker    fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#4a148c
+    classDef db        fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+    classDef client    fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#5d4037
+
+    class GatewayApp gateway
+    class V1App,V2App,V3App validator
+    class RMQ1,RMQ2,RMQ3,EX1,EX2,EX3,EX4 broker
+    class GatewayMongo,V1Mongo,V2Mongo,V3Mongo db
+    class Voter,Admin client

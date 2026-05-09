@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# TypeScript build output (npm run build → dist/)
+dist/
+
+# Lock files — large, not useful for code understanding
+package-lock.json
+
+# Coverage & test output
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+logs/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

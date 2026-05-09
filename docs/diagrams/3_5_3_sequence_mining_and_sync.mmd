@@ -1,0 +1,81 @@
+%% =============================================================================
+%%  Section 3.5.3 — Block mining and chain synchronisation (Validators)
+%%  Mirrors the setInterval mining loop in src/server.ts and the
+%%  ChainSyncService.handleReceivedBlock decision tree.
+%% =============================================================================
+
+sequenceDiagram
+    autonumber
+    participant Loop  as setInterval<br/>(Validator A — miner)
+    participant TP_A  as TransactionPool<br/>(Validator A)
+    participant BC_A  as Blockchain<br/>(Validator A)
+    participant DB_A  as MongoDB<br/>(Validator A)
+    participant MB_A  as MessageBus<br/>(Validator A)
+    participant RMQ   as voting.blocks<br/>+ voting.chain-req<br/>(fanout exchanges)
+    participant MB_B  as MessageBus<br/>(node B — receiver)
+    participant CS_B  as ChainSyncService<br/>(node B)
+    participant BC_B  as Blockchain<br/>(node B)
+    participant TP_B  as TransactionPool<br/>(node B)
+    participant DB_B  as MongoDB<br/>(node B)
+
+    %% ── Mining cycle ─────────────────────────────────────────────────
+    Note over Loop: every VALIDATOR_INTERVAL_MS (default 15000 ms)
+    Loop->>TP_A: size
+    alt pool empty
+        Note over Loop: skip cycle
+    end
+
+    rect rgba(200,230,201,0.20)
+        Note over Loop,DB_A: Drain mempool and seal a new block
+        Loop->>TP_A: getTransactions()
+        TP_A-->>Loop: votes: Vote[]
+        Loop->>TP_A: clearPool()
+        Loop->>BC_A: addBlock(votes)
+        Note right of BC_A: builds Block(prev.index+1,<br/>now, votes, prev.hash, 0)<br/>hash = SHA-256(canonical header)
+        BC_A-->>Loop: newBlock
+        Loop->>DB_A: BlockModel.create(newBlock.toJSON())
+        Loop->>MB_A: publishBlock(newBlock)
+        MB_A->>RMQ: AMQP publish BLOCK
+    end
+
+    %% ── Receivers ────────────────────────────────────────────────────
+    par Fanout to every other node
+        RMQ-->>MB_B: deliver BLOCK message
+    end
+
+    rect rgba(173,216,230,0.18)
+        Note over MB_B,DB_B: ChainSyncService decision tree
+        MB_B->>CS_B: handleReceivedBlock(JSON.stringify(block))
+        CS_B->>BC_B: getLatestBlock()
+        BC_B-->>CS_B: localTip
+
+        alt receivedBlock.index ≤ localTip.index
+            Note over CS_B: stale → ignore
+        else localTip.hash === receivedBlock.previousHash
+            Note over CS_B: FAST PATH — extends our tip
+            CS_B->>CS_B: rebuild Block, recompute hash
+            alt hash mismatch
+                Note over CS_B: tampered → reject
+            end
+            CS_B->>BC_B: chain.push(block)
+            CS_B->>TP_B: removeMinedTransactions(sigSet)
+            CS_B->>DB_B: BlockModel.updateOne (upsert)
+            CS_B->>MB_B: onPublishBlock(block)<br/>(propagate to peers)
+        else gap detected (receivedBlock.index > localTip.index + 1<br/>or wrong previousHash)
+            Note over CS_B: SLOW PATH — full chain sync
+            CS_B->>MB_B: onRequestFullChain()
+            MB_B->>RMQ: publish CHAIN_REQUEST<br/>(replyQueue=chain-res.{nodeName})
+            Note over RMQ: wait CHAIN_SYNC_TIMEOUT_MS (5 s)<br/>collect chains from all peers
+            RMQ-->>MB_B: collected IBlock[][]
+            MB_B-->>CS_B: chains
+            CS_B->>CS_B: pick longest, validate hashes + links
+            alt invalid or not longer
+                Note over CS_B: keep local chain
+            else valid and longer
+                CS_B->>BC_B: chain = candidate
+                CS_B->>TP_B: removeMinedTransactions(allMinedSigs)
+                CS_B->>DB_B: deleteMany + insertMany (replace)
+                CS_B->>MB_B: onPublishBlock(latestTip)
+            end
+        end
+    end

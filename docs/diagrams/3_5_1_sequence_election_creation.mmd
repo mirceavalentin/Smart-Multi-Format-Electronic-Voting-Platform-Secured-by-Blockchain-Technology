@@ -1,0 +1,44 @@
+%% =============================================================================
+%%  Section 3.5.1 — Election creation (admin)
+%%  Mirrors POST /api/election in src/server.ts and the ELECTION
+%%  subscription wired up in main().
+%% =============================================================================
+
+sequenceDiagram
+    autonumber
+    actor Admin as Admin browser
+    participant AdminJS as public/admin.js
+    participant GW    as Gateway<br/>(server.ts)
+    participant E_GW  as Election<br/>(Gateway)
+    participant MB_GW as MessageBus<br/>(Gateway)
+    participant RMQ   as voting.election<br/>(fanout exchange)
+    participant MB_V  as MessageBus<br/>(Validator N)
+    participant E_V   as Election<br/>(Validator N)
+    participant Timer as setTimeout<br/>(Validator N)
+
+    Admin->>AdminJS: pick type, fill candidates /<br/>question / maxSelections / whitelist / duration
+    AdminJS->>GW: POST /api/election { type, candidates,<br/>question?, maxSelections?, whitelist, durationSeconds }
+
+    rect rgba(173,216,230,0.18)
+        Note over GW: Validate request<br/>(type discriminator,<br/>per-format rules)
+        GW->>GW: build endTime = Date.now() + duration*1000<br/>build electionId = "election-"+Date.now()
+        GW->>E_GW: activate({ electionId, type, candidates,<br/>question?, maxSelections?, whitelist, endTime })
+        E_GW-->>GW: config stored in memory
+        GW->>MB_GW: publishElection(cfg)
+        MB_GW->>RMQ: AMQP publish (durable, persistent=true)
+        GW->>GW: scheduleAutoWipe(cfg, durationMs,<br/>onPreWipe = save lastTally)
+        GW-->>AdminJS: 201 { message, election: cfg }
+        AdminJS-->>Admin: status banner shows<br/>"type · detail · Ns left"
+    end
+
+    par Fanout to every node (incl. Gateway itself, but Gateway skips its own fromNode)
+        RMQ-->>MB_V: deliver ELECTION message
+    end
+
+    rect rgba(255,224,178,0.25)
+        Note over MB_V,Timer: Each Validator processes the broadcast independently
+        MB_V->>E_V: activate(cfg)
+        E_V-->>MB_V: config stored locally
+        MB_V->>Timer: scheduleAutoWipe(cfg,<br/>cfg.endTime - Date.now())
+        Note over Timer: Will fire on every node at<br/>the same wall-clock time<br/>(tally + wipe + reset to genesis)
+    end

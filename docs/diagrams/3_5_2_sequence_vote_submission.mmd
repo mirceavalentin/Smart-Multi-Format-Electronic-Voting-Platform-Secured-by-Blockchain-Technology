@@ -1,0 +1,72 @@
+%% =============================================================================
+%%  Section 3.5.2 — Vote submission and validation (voter)
+%%  Mirrors POST /api/vote in src/server.ts (3-layer pipeline) and the
+%%  VOTE subscription handled by TransactionGossipService on every Validator.
+%% =============================================================================
+
+sequenceDiagram
+    autonumber
+    actor Voter as Voter browser
+    participant MM    as MetaMask<br/>(wallet)
+    participant VJS   as public/voter.js
+    participant GW    as Gateway<br/>(server.ts<br/>POST /api/vote)
+    participant E_GW  as Election<br/>(Gateway)
+    participant ST_GW as State<br/>(Gateway)
+    participant ETH   as ethers.verifyMessage
+    participant TP_GW as TransactionPool<br/>(Gateway)
+    participant MB_GW as MessageBus<br/>(Gateway)
+    participant RMQ   as voting.votes<br/>(fanout exchange)
+    participant MB_V  as MessageBus<br/>(Validator N)
+    participant TGS_V as TransactionGossipService<br/>(Validator N)
+    participant TP_V  as TransactionPool<br/>(Validator N)
+
+    Voter->>VJS: select option(s) on ballot
+    Note over VJS: Encode candidateId per type:<br/>single-choice: "Alice"<br/>yes-no: "yes" / "no"<br/>multi: "Alice|Bob" (pipe-delimited)
+    VJS->>VJS: build voteData =<br/>{ senderPublicKey, candidateId,<br/>electionId, timestamp }
+    VJS->>MM: signMessage(JSON.stringify(voteData))
+    MM-->>VJS: signature (ECDSA, secp256k1)
+    VJS->>GW: POST /api/vote<br/>{ ...voteData, signature }
+
+    rect rgba(173,216,230,0.18)
+        Note over GW: Three-layer validation pipeline
+        GW->>E_GW: isVoteValid({ senderPublicKey, candidateId })
+        Note right of E_GW: validateBallotPayload()<br/>branches on cfg.type:<br/>• single → in candidates<br/>• yes-no → "yes"|"no"<br/>• multi → split "|", ≤ maxSelections,<br/>no dups, all in candidates
+        E_GW-->>GW: { valid, reason? }
+
+        alt invalid
+            GW-->>VJS: 400 { error: reason }
+            VJS-->>Voter: log error
+        end
+
+        GW->>ST_GW: hasVoted(senderPublicKey)
+        ST_GW-->>GW: boolean
+        alt already voted
+            GW-->>VJS: 400 { error: "This address has already voted." }
+        end
+
+        GW->>ETH: verifyMessage(JSON.stringify(payload), signature)
+        ETH-->>GW: recovered address
+        alt mismatch
+            GW-->>VJS: 400 { error: "Invalid signature." }
+        end
+    end
+
+    rect rgba(200,230,201,0.25)
+        Note over GW: All checks passed — accept and broadcast
+        GW->>ST_GW: markVoted(senderPublicKey)
+        GW->>TP_GW: addTransaction(vote)
+        GW->>MB_GW: publishVote(vote)
+        MB_GW->>RMQ: AMQP publish (durable)
+        GW-->>VJS: 200 { message: "Vote accepted." }
+        VJS-->>Voter: status "Vote accepted (candidateId)"
+    end
+
+    par Fanout to every Validator (Gateway does NOT subscribe to votes)
+        RMQ-->>MB_V: deliver VOTE message
+    end
+
+    rect rgba(255,224,178,0.25)
+        MB_V->>TGS_V: handleIncomingVote(JSON.stringify(vote))
+        TGS_V->>TP_V: addTransaction(vote)
+        Note right of TP_V: vote will be sealed in<br/>the next mining cycle<br/>(see section 3.5.3)
+    end

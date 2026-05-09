@@ -1,208 +1,243 @@
 /**
- * ============================================================================
- *  network/chainSyncService.ts — Blockchain sync + persistence module.
- * ============================================================================
+ * chainSyncService.ts — Blockchain sync and persistence logic.
  *
- * This module isolates the heavy chain reconciliation logic from the socket
- * orchestration layer (`p2p.ts`). It is responsible for:
+ * This module is responsible for deciding what to do when a new block
+ * arrives from the message bus — append it, request a full chain, or
+ * ignore it — and for keeping MongoDB in sync with whatever the node
+ * decides is the authoritative chain.
  *
- *   1. Interpreting RESPONSE_BLOCKCHAIN payloads.
- *   2. Deciding append vs full-chain replacement.
- *   3. Validating candidate chains.
- *   4. Persisting accepted blocks to MongoDB.
- *   5. Triggering follow-up gossip messages when needed.
+ * It is deliberately decoupled from the transport layer (RabbitMQ) via
+ * two callbacks injected at construction time. This makes the class easy
+ * to unit-test without a live broker: just pass mock callbacks.
  *
- * Keeping this logic separate makes P2P orchestration easier to reason about,
- * easier to test, and easier to defend as clean separation of concerns.
- * ============================================================================
+ * DECISION TREE (called on every incoming BLOCK message)
+ * ───────────────────────────────────────────────────────
+ *
+ *   Received block index <= local tip index
+ *     → stale, ignore.
+ *
+ *   Received block's previousHash === local tip's hash
+ *     → fast path: append directly, persist to MongoDB, forward block.
+ *
+ *   Received block's index > local tip + 1 (gap)
+ *     → slow path: request full chain from all peers, validate, replace.
  */
 
 import type { Block as IBlock } from "../models/block.js";
-import { Block } from "../core/Block.js";
-import { Blockchain } from "../core/Blockchain.js";
-import { TransactionPool } from "../core/TransactionPool.js";
-import { BlockModel } from "../db/models.js";
-import {
-  queryAllMsg,
-  responseBlockchainMsg,
-  type P2PMessage,
-} from "./messageTypes.js";
+import { Block }               from "../core/Block.js";
+import { Blockchain }          from "../core/Blockchain.js";
+import { TransactionPool }     from "../core/TransactionPool.js";
+import { BlockModel }          from "../db/models.js";
 
 export class ChainSyncService {
-  private blockchain: Blockchain;
-  private txPool: TransactionPool;
-  private nodeName: string;
-  private onBroadcast: (message: P2PMessage) => void;
+  /**
+   * Called when this node appended or forwarded a block that peers
+   * may not have yet. The callback should publish the block to the
+   * message bus so all peers can update their chains.
+   */
+  private readonly onPublishBlock: (block: IBlock) => void;
+
+  /**
+   * Called when a received block cannot be appended directly (gap in
+   * chain). The callback should broadcast a CHAIN_REQUEST to all peers
+   * and return all the chains they send back.
+   */
+  private readonly onRequestFullChain: () => Promise<IBlock[][]>;
 
   constructor(
-    blockchain: Blockchain,
-    txPool: TransactionPool,
-    nodeName: string,
-    onBroadcast: (message: P2PMessage) => void,
+    private readonly blockchain: Blockchain,
+    private readonly txPool:     TransactionPool,
+    private readonly nodeName:   string,
+    onPublishBlock:     (block: IBlock) => void,
+    onRequestFullChain: () => Promise<IBlock[][]>,
   ) {
-    this.blockchain = blockchain;
-    this.txPool = txPool;
-    this.nodeName = nodeName;
-    this.onBroadcast = onBroadcast;
+    this.onPublishBlock      = onPublishBlock;
+    this.onRequestFullChain  = onRequestFullChain;
   }
 
-  /** Entry point for handling RESPONSE_BLOCKCHAIN data payloads. */
-  public handleBlockchainResponse(data: string): void {
-    let receivedBlocks: IBlock[];
+  // ── Entry point ───────────────────────────────────────────────────
+
+  /**
+   * Process a block received from a peer via the message bus.
+   *
+   * The data parameter is a JSON string so the method signature is
+   * consistent with how RabbitMQ message bodies arrive (as raw strings
+   * after calling msg.content.toString()). This keeps the parsing
+   * concern inside the service rather than in the caller.
+   */
+  public handleReceivedBlock(data: string): void {
+    let receivedBlock: IBlock;
     try {
-      receivedBlocks = JSON.parse(data) as IBlock[];
+      receivedBlock = JSON.parse(data) as IBlock;
     } catch {
-      console.warn(`[${this.nodeName}] [P2P] Invalid blockchain data received, ignoring.`);
+      console.warn(`[${this.nodeName}] [Sync] Invalid block data received — ignoring.`);
       return;
     }
 
-    if (receivedBlocks.length === 0) {
-      console.log(`[${this.nodeName}] [P2P] Received empty blockchain response, ignoring.`);
-      return;
-    }
-
-    receivedBlocks.sort((a, b) => a.index - b.index);
-
-    const latestReceived = receivedBlocks[receivedBlocks.length - 1]!;
     const latestLocal = this.blockchain.getLatestBlock();
 
-    if (latestReceived.index <= latestLocal.index) {
+    // Block is not newer than what we have — nothing to do.
+    if (receivedBlock.index <= latestLocal.index) {
       console.log(
-        `[${this.nodeName}] [P2P] Peer chain (height ${latestReceived.index}) ` +
-        `<= local chain (height ${latestLocal.index}). No action needed.`,
+        `[${this.nodeName}] [Sync] Received block ${receivedBlock.index} ` +
+        `<= local tip ${latestLocal.index} — stale, ignoring.`,
       );
       return;
     }
 
+    // Fast path: received block extends our current tip directly.
+    if (latestLocal.hash === receivedBlock.previousHash) {
+      this.appendBlock(receivedBlock);
+      return;
+    }
+
+    // Slow path: gap in chain — kick off async full-chain sync.
     console.log(
-      `[${this.nodeName}] [P2P] Peer has a longer chain ` +
-      `(peer height: ${latestReceived.index}, local height: ${latestLocal.index}).`,
+      `[${this.nodeName}] [Sync] Block ${receivedBlock.index} does not extend ` +
+      `local tip (index ${latestLocal.index}) — requesting full chain from peers.`,
     );
-
-    if (latestLocal.hash === latestReceived.previousHash) {
-      this.appendSingleBlock(latestReceived);
-      return;
-    }
-
-    if (receivedBlocks.length === 1) {
-      console.log(`[${this.nodeName}] [P2P] Single block received but can't append. Requesting full chain...`);
-      this.onBroadcast(queryAllMsg());
-      return;
-    }
-
-    console.log(`[${this.nodeName}] [P2P] Received full chain (${receivedBlocks.length} blocks). Evaluating...`);
-    this.tryReplaceChain(receivedBlocks);
+    this.syncFullChain().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${this.nodeName}] [Sync] Full chain sync failed: ${msg}`);
+    });
   }
 
-  private appendSingleBlock(receivedBlock: IBlock): void {
-    console.log(`[${this.nodeName}] [P2P] Appending single new block (index ${receivedBlock.index}).`);
+  // ── Block append (fast path) ──────────────────────────────────────
 
-    const newBlock = new Block(
-      receivedBlock.index,
-      receivedBlock.timestamp,
-      receivedBlock.transactions,
-      receivedBlock.previousHash,
-      receivedBlock.nonce,
+  /**
+   * Validate and append a single block to the local chain.
+   *
+   * We reconstruct the block via the Block constructor so calculateHash()
+   * runs, then verify the stored hash matches. If it doesn't, the block
+   * was tampered with in transit and we reject it.
+   */
+  private appendBlock(received: IBlock): void {
+    const block = new Block(
+      received.index,
+      received.timestamp,
+      received.transactions,
+      received.previousHash,
+      received.nonce,
     );
 
-    if (newBlock.hash !== receivedBlock.hash) {
-      console.warn(`[${this.nodeName}] [P2P] Block hash mismatch - rejecting.`);
+    if (block.hash !== received.hash) {
+      console.warn(
+        `[${this.nodeName}] [Sync] Hash mismatch on block ${received.index} — rejecting.`,
+      );
       return;
     }
 
-    this.blockchain.chain.push(newBlock);
+    this.blockchain.chain.push(block);
+    console.log(`[${this.nodeName}] [Sync] Appended block ${block.index} (hash: ${block.hash.slice(0, 12)}…).`);
 
-    // Remove mined transactions from our local pool to prevent duplicate mining
-    const minedSigs = new Set<string>();
-    for (const tx of newBlock.transactions) {
-      minedSigs.add(tx.signature);
-    }
+    // Remove votes that are now sealed in this block from our mempool
+    // so the next Validator cycle doesn't try to include them again.
+    const minedSigs = new Set(block.transactions.map((tx) => tx.signature));
     this.txPool.removeMinedTransactions(minedSigs);
 
-    this.persistBlock(newBlock).catch((err) => {
-      console.error(`[${this.nodeName}] [P2P] Failed to persist received block:`, err);
+    // Persist the new block to MongoDB.
+    this.persistBlock(block).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${this.nodeName}] [Sync] Failed to persist block ${block.index}: ${msg}`);
     });
 
-    this.onBroadcast(responseBlockchainMsg([newBlock]));
+    // Tell peers about the block we just appended (they may not have it).
+    this.onPublishBlock(block);
   }
 
+  // ── Full chain sync (slow path) ───────────────────────────────────
+
+  /**
+   * Request the full chain from all peers, then replace the local chain
+   * if any peer has a longer valid one.
+   */
+  private async syncFullChain(): Promise<void> {
+    const allChains = await this.onRequestFullChain();
+
+    if (allChains.length === 0) {
+      console.warn(`[${this.nodeName}] [Sync] No chain responses received — keeping local chain.`);
+      return;
+    }
+
+    // Pick the longest chain we received (we'll validate it before using it).
+    const longest = allChains.reduce(
+      (best, chain) => chain.length > best.length ? chain : best,
+      allChains[0]!,
+    );
+
+    this.tryReplaceChain(longest);
+  }
+
+  /**
+   * Validate a candidate chain and replace the local one if it is both
+   * longer and cryptographically valid.
+   */
   private tryReplaceChain(receivedBlocks: IBlock[]): void {
-    const candidateChain: Block[] = receivedBlocks.map(
+    // Reconstruct Block instances so we can call isChainValid().
+    const candidate: Block[] = receivedBlocks.map(
       (b) => new Block(b.index, b.timestamp, b.transactions, b.previousHash, b.nonce),
     );
 
-    for (let i = 0; i < candidateChain.length; i++) {
-      if (candidateChain[i]!.hash !== receivedBlocks[i]!.hash) {
-        console.warn(`[${this.nodeName}] [P2P] Hash mismatch at block ${i}. Rejecting chain.`);
+    // Verify that every stored hash matches the recomputed hash.
+    for (let i = 0; i < candidate.length; i++) {
+      if (candidate[i]!.hash !== receivedBlocks[i]!.hash) {
+        console.warn(`[${this.nodeName}] [Sync] Hash mismatch at index ${i} — rejecting chain.`);
         return;
       }
     }
 
-    const tempBlockchain = new Blockchain();
-    tempBlockchain.chain = candidateChain;
-
-    if (!tempBlockchain.isChainValid()) {
-      console.warn(`[${this.nodeName}] [P2P] Received chain is invalid. Rejecting.`);
+    // Verify hash-links and block ordering.
+    const tempChain = new Blockchain();
+    tempChain.chain = candidate;
+    if (!tempChain.isChainValid()) {
+      console.warn(`[${this.nodeName}] [Sync] Received chain failed validation — rejecting.`);
       return;
     }
 
-    if (candidateChain.length <= this.blockchain.chain.length) {
-      console.log(`[${this.nodeName}] [P2P] Received chain is not longer. Keeping local chain.`);
+    if (candidate.length <= this.blockchain.chain.length) {
+      console.log(`[${this.nodeName}] [Sync] Received chain is not longer than local — keeping local.`);
       return;
     }
 
     console.log(
-      `[${this.nodeName}] [P2P] Replacing local chain ` +
-      `(${this.blockchain.chain.length} blocks -> ${candidateChain.length} blocks).`,
+      `[${this.nodeName}] [Sync] Replacing chain: ` +
+      `${this.blockchain.chain.length} → ${candidate.length} blocks.`,
     );
 
-    this.blockchain.chain = candidateChain;
+    this.blockchain.chain = candidate;
 
-    // After replacing the full chain, clear pool of any already-mined transactions
-    const allMinedSigs = new Set<string>();
-    for (const block of candidateChain) {
-      for (const tx of block.transactions) {
-        allMinedSigs.add(tx.signature);
-      }
-    }
+    // Remove all votes that appear in the new chain from the mempool.
+    const allMinedSigs = new Set<string>(
+      candidate.flatMap((b) => b.transactions.map((tx) => tx.signature)),
+    );
     this.txPool.removeMinedTransactions(allMinedSigs);
 
-    this.persistFullChain(candidateChain).catch((err) => {
-      console.error(`[${this.nodeName}] [P2P] Failed to persist replaced chain:`, err);
+    // Persist the entire new chain to MongoDB (replaces old blocks).
+    this.persistFullChain(candidate).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${this.nodeName}] [Sync] Failed to persist replaced chain: ${msg}`);
     });
 
-    this.onBroadcast(responseBlockchainMsg([this.blockchain.getLatestBlock()]));
+    // Inform peers of the new tip.
+    this.onPublishBlock(this.blockchain.getLatestBlock());
   }
 
+  // ── Persistence ───────────────────────────────────────────────────
+
+  /** Upsert a single block into MongoDB. */
   private async persistBlock(block: Block): Promise<void> {
     await BlockModel.updateOne(
       { index: block.index },
-      {
-        $set: {
-          index: block.index,
-          timestamp: block.timestamp,
-          transactions: block.transactions,
-          previousHash: block.previousHash,
-          hash: block.hash,
-          nonce: block.nonce,
-        },
-      },
+      { $set: block.toJSON() },
       { upsert: true },
     );
-    console.log(`[${this.nodeName}] [P2P] Block ${block.index} persisted to MongoDB.`);
+    console.log(`[${this.nodeName}] [Sync] Block ${block.index} persisted to MongoDB.`);
   }
 
+  /** Replace MongoDB's entire blocks collection with the new chain. */
   private async persistFullChain(chain: Block[]): Promise<void> {
     await BlockModel.deleteMany({});
-    const docs = chain.map((b) => ({
-      index: b.index,
-      timestamp: b.timestamp,
-      transactions: b.transactions,
-      previousHash: b.previousHash,
-      hash: b.hash,
-      nonce: b.nonce,
-    }));
-    await BlockModel.insertMany(docs);
-    console.log(`[${this.nodeName}] [P2P] Full chain (${chain.length} blocks) persisted to MongoDB.`);
+    await BlockModel.insertMany(chain.map((b) => b.toJSON()));
+    console.log(`[${this.nodeName}] [Sync] Full chain (${chain.length} blocks) persisted to MongoDB.`);
   }
 }
